@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::cache::normalize_usage;
 use crate::error::CoreError;
 use crate::ir::{Content, Item, ProviderId, Response, Role, StopReason};
+use crate::provider::{anthropic_stop_reason, cc_finish_to_stop_reason};
 use crate::sse::SseFrame;
 use crate::stream::{ResponseHeader, StreamEvent};
 
@@ -50,28 +51,6 @@ fn s(v: &Value, key: &str) -> String {
 
 fn n(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
-}
-
-fn cc_finish_to_stop(s: &str) -> StopReason {
-    match s {
-        "stop" => StopReason::EndTurn,
-        "length" => StopReason::MaxTokens,
-        "tool_calls" | "function_call" => StopReason::ToolUse,
-        "stop_sequence" => StopReason::StopSequence,
-        _ => StopReason::Other,
-    }
-}
-
-fn anthropic_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "tool_use" => StopReason::ToolUse,
-        "refusal" => StopReason::Refusal,
-        "pause_turn" => StopReason::Paused,
-        _ => StopReason::Other,
-    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -176,7 +155,7 @@ impl StreamDecoder for CcDecoder {
                 }
             }
             if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                self.stop_reason = Some(cc_finish_to_stop(fr));
+                self.stop_reason = Some(cc_finish_to_stop_reason(fr));
             }
         }
         if chunk.get("usage").is_some() {

@@ -12,7 +12,7 @@ use crate::error::CoreError;
 use crate::ir::{
     Content, ContentBlock, ImageSource, Item, Request, Response, Role, StopReason, ToolChoice,
 };
-use crate::provider::{Provider, f32_to_value, model_string};
+use crate::provider::{Provider, cc_finish_to_stop_reason, f32_to_value, model_string};
 
 /// The Chat Completions dialect adapter, parameterized by the concrete provider (for usage quirks).
 pub struct ChatCompletions {
@@ -138,7 +138,7 @@ impl Provider for ChatCompletions {
         let stop_reason = choice
             .get("finish_reason")
             .and_then(|v| v.as_str())
-            .map(finish_to_stop_reason)
+            .map(cc_finish_to_stop_reason)
             .unwrap_or(StopReason::Other);
 
         let usage = body
@@ -255,17 +255,6 @@ fn build_tool_choice(tc: &ToolChoice) -> Value {
         ToolChoice::None => json!("none"),
         ToolChoice::Required => json!("required"),
         ToolChoice::Named { name } => json!({ "type": "function", "function": { "name": name } }),
-    }
-}
-
-fn finish_to_stop_reason(s: &str) -> StopReason {
-    match s {
-        "stop" => StopReason::EndTurn,
-        "length" => StopReason::MaxTokens,
-        "tool_calls" | "function_call" => StopReason::ToolUse,
-        "stop_sequence" => StopReason::StopSequence,
-        // DESIGN.md §5.4: content_filter → other.
-        _ => StopReason::Other,
     }
 }
 

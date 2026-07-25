@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::error::CoreError;
-use crate::ir::{ModelRef, ProviderId, Request, Response};
+use crate::ir::{ModelRef, ProviderId, Request, Response, StopReason};
 
 /// A provider wire-format family (`DESIGN.md` §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,5 +86,29 @@ pub(crate) fn f32_to_value(x: f32) -> Value {
     match format!("{x}").parse::<f64>() {
         Ok(n) => Value::from(n),
         Err(_) => Value::Null,
+    }
+}
+
+/// Map a Chat Completions `finish_reason` onto a canonical `StopReason` (`DESIGN.md` §5.4).
+pub(crate) fn cc_finish_to_stop_reason(s: &str) -> StopReason {
+    match s {
+        "stop" => StopReason::EndTurn,
+        "length" => StopReason::MaxTokens,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        "stop_sequence" => StopReason::StopSequence,
+        _ => StopReason::Other,
+    }
+}
+
+/// Map an Anthropic `stop_reason` onto a canonical `StopReason` (`DESIGN.md` §5.4).
+pub(crate) fn anthropic_stop_reason(s: &str) -> StopReason {
+    match s {
+        "end_turn" => StopReason::EndTurn,
+        "max_tokens" => StopReason::MaxTokens,
+        "stop_sequence" => StopReason::StopSequence,
+        "tool_use" => StopReason::ToolUse,
+        "refusal" => StopReason::Refusal,
+        "pause_turn" => StopReason::Paused,
+        _ => StopReason::Other,
     }
 }

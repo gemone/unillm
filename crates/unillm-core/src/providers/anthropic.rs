@@ -12,7 +12,7 @@ use crate::ir::{
     Breakpoint, CacheControl, CacheStrategy, Content, ContentBlock, ImageSource, Item, ProviderId,
     Request, Response, Role, StopReason, ToolChoice, Ttl,
 };
-use crate::provider::{Provider, f32_to_value, model_string};
+use crate::provider::{Provider, anthropic_stop_reason, f32_to_value, model_string};
 
 /// The Anthropic Messages dialect adapter.
 pub struct Anthropic;
@@ -355,18 +355,6 @@ fn anthropic_tool_choice(tc: &ToolChoice) -> Value {
         // CC "required" has no direct Anthropic equivalent; "any" forces a tool call.
         ToolChoice::Required => json!({ "type": "any" }),
         ToolChoice::Named { name } => json!({ "type": "tool", "name": name }),
-    }
-}
-
-fn anthropic_stop_reason(s: &str) -> StopReason {
-    match s {
-        "end_turn" => StopReason::EndTurn,
-        "max_tokens" => StopReason::MaxTokens,
-        "stop_sequence" => StopReason::StopSequence,
-        "tool_use" => StopReason::ToolUse,
-        "refusal" => StopReason::Refusal,
-        "pause_turn" => StopReason::Paused,
-        _ => StopReason::Other,
     }
 }
 
