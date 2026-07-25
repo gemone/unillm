@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::{s, sampling};
+use super::{get_str, sampling};
 use unillm_core::ir::{
     Content, ContentBlock, ImageSource, Item, ModelRef, Request, Role, ToolChoice, ToolDef,
 };
@@ -31,7 +31,7 @@ pub fn parse_cc_request(body: &Value) -> Result<Request, unillm_core::CoreError>
                 for tc in tool_calls {
                     let function = tc.get("function");
                     input.push(Item::FunctionCall {
-                        id: s(tc, "id"),
+                        id: get_str(tc, "id"),
                         name: function
                             .and_then(|f| f.get("name"))
                             .and_then(|v| v.as_str())
@@ -50,7 +50,7 @@ pub fn parse_cc_request(body: &Value) -> Result<Request, unillm_core::CoreError>
 
             if role == "tool" {
                 input.push(Item::FunctionCallOutput {
-                    call_id: s(m, "tool_call_id"),
+                    call_id: get_str(m, "tool_call_id"),
                     output: m
                         .get("content")
                         .and_then(|v| v.as_str())
@@ -119,10 +119,9 @@ fn parse_part(p: &Value) -> Option<ContentBlock> {
                 .get("image_url")
                 .and_then(|v| v.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .unwrap_or("");
             Some(ContentBlock::Image {
-                source: ImageSource::Url { url },
+                source: parse_image_url(url),
                 cache_control: None,
             })
         }
@@ -137,10 +136,26 @@ fn parse_part(p: &Value) -> Option<ContentBlock> {
     }
 }
 
+/// A CC `image_url` may be a real URL or an inline `data:<media>;base64,<data>` URL (§5.2). The
+/// latter decodes to a canonical base64 source so it re-translates correctly to Anthropic.
+fn parse_image_url(url: &str) -> ImageSource {
+    if let Some(rest) = url.strip_prefix("data:") {
+        if let Some((media, data)) = rest.split_once(";base64,") {
+            return ImageSource::Base64 {
+                media_type: media.to_string(),
+                data: data.to_string(),
+            };
+        }
+    }
+    ImageSource::Url {
+        url: url.to_string(),
+    }
+}
+
 fn parse_tool(t: &Value) -> Option<ToolDef> {
     let function = t.get("function")?;
     Some(ToolDef {
-        name: s(function, "name"),
+        name: get_str(function, "name"),
         description: function
             .get("description")
             .and_then(|v| v.as_str())
@@ -264,5 +279,56 @@ mod tests {
         assert!(matches!(recovered.tool_choice, Some(ToolChoice::Auto)));
         // cache strategy is inbound-default (auto), not the original's.
         assert!(matches!(recovered.cache, CacheStrategy::Auto));
+    }
+
+    #[test]
+    fn parse_image_url_variants() {
+        assert!(matches!(
+            parse_image_url("https://x/a.png"),
+            ImageSource::Url { .. }
+        ));
+        match parse_image_url("data:image/png;base64,QUJD") {
+            ImageSource::Base64 { media_type, data } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, "QUJD");
+            }
+            other => panic!("expected Base64, got {other:?}"),
+        }
+        // A non-base64 data URL is not decodable → falls back to Url.
+        assert!(matches!(
+            parse_image_url("data:text/plain,hello"),
+            ImageSource::Url { .. }
+        ));
+    }
+
+    /// A canonical base64 image → CC payload (data URL) → parsed back, recovers Base64 — i.e. the
+    /// inbound is the true inverse of §5.2's base64→data-URL rule, so it re-translates to Anthropic.
+    #[test]
+    fn roundtrip_base64_image_through_cc() {
+        let original: Request = serde_json::from_str(
+            r#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}
+            ]}]}"#,
+        )
+        .unwrap();
+        let payload =
+            ChatCompletions::new(unillm_core::ProviderId::Openai).build_payload(&original);
+        let recovered = parse_cc_request(&payload).unwrap();
+        match &recovered.input[0] {
+            Item::Message {
+                content: Content::Blocks(b),
+                ..
+            } => match &b[0] {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { media_type, data },
+                    ..
+                } => {
+                    assert_eq!(media_type, "image/png");
+                    assert_eq!(data, "QUJD");
+                }
+                other => panic!("expected base64 Image, got {other:?}"),
+            },
+            other => panic!("expected image Message, got {other:?}"),
+        }
     }
 }

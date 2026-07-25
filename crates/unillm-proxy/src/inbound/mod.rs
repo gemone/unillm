@@ -61,7 +61,7 @@ pub fn parse_request(format: Format, body: &Value) -> Result<Request, CoreError>
 }
 
 /// Read a string field, defaulting to `""` (shared by the dialect parsers).
-pub(super) fn s(v: &Value, key: &str) -> String {
+pub(super) fn get_str(v: &Value, key: &str) -> String {
     v.get(key)
         .and_then(|v| v.as_str())
         .unwrap_or("")

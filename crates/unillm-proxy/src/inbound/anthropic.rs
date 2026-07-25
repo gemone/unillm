@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::{s, sampling};
+use super::{get_str, sampling};
 use unillm_core::ir::{
     Content, ContentBlock, ImageSource, Item, ModelRef, Request, Role, ToolChoice, ToolDef,
 };
@@ -53,8 +53,8 @@ pub fn parse_anthropic_request(body: &Value) -> Result<Request, unillm_core::Cor
                                 // canonical order is [Message, FunctionCall] (matches §5.4).
                                 flush_message(&mut input, &mut blocks, role_enum);
                                 input.push(Item::FunctionCall {
-                                    id: s(b, "id"),
-                                    name: s(b, "name"),
+                                    id: get_str(b, "id"),
+                                    name: get_str(b, "name"),
                                     // `input` object → canonical `arguments` JSON string.
                                     arguments: serde_json::to_string(
                                         b.get("input")
@@ -66,7 +66,7 @@ pub fn parse_anthropic_request(body: &Value) -> Result<Request, unillm_core::Cor
                             "tool_result" => {
                                 flush_message(&mut input, &mut blocks, role_enum);
                                 input.push(Item::FunctionCallOutput {
-                                    call_id: s(b, "tool_use_id"),
+                                    call_id: get_str(b, "tool_use_id"),
                                     output: match b.get("content") {
                                         Some(Value::String(s)) => s.clone(),
                                         Some(other) => other.to_string(),
@@ -169,7 +169,7 @@ fn parse_image_source(b: &Value) -> ImageSource {
 
 fn parse_tool(t: &Value) -> Option<ToolDef> {
     Some(ToolDef {
-        name: s(t, "name"),
+        name: get_str(t, "name"),
         description: t
             .get("description")
             .and_then(|v| v.as_str())
@@ -188,7 +188,9 @@ fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
         "auto" => ToolChoice::Auto,
         "none" => ToolChoice::None,
         "any" => ToolChoice::Required,
-        "tool" => ToolChoice::Named { name: s(v, "name") },
+        "tool" => ToolChoice::Named {
+            name: get_str(v, "name"),
+        },
         _ => return None,
     })
 }
