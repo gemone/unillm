@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Env / local data
+.env
+.env.*
+*.db
+*.db-*
+unillm.db*
+
+# Local tooling state
+.claude/
+.omc/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
