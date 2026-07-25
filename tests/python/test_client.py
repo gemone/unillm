@@ -7,7 +7,6 @@ import json
 import pytest
 
 import unillm
-from unillm import UnillmError
 
 from .conftest import MockServer
 
@@ -75,9 +74,12 @@ async def test_create_error_maps_to_unillm_error(mock_server: MockServer) -> Non
     mock_server.body = {"error": {"message": "slow down"}}
     client = unillm.Client("openai", "sk-test", base_url=mock_server.url)
 
-    with pytest.raises(UnillmError) as exc_info:
+    with pytest.raises(unillm.RateLimitError) as exc_info:
         await client.create("gpt-4o", input="hi")
-    assert "rate_limited" in str(exc_info.value)
+    assert exc_info.value.kind == "rate_limited"
+    assert "slow down" in str(exc_info.value)
+    # RateLimitError is still an UnillmError
+    assert isinstance(exc_info.value, unillm.UnillmError)
 
 
 async def test_string_input_becomes_user_message(mock_server: MockServer) -> None:

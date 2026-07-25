@@ -14,15 +14,43 @@ from typing import Any, Mapping, Sequence
 
 from ._native import Client as _NativeClient
 from ._native import EventStream as _NativeEventStream
-from ._native import UnillmError
+from ._native import UnillmError as _NativeUnillmError
 from ._native import __version__
+from .exceptions import (
+    AuthenticationError,
+    InvalidRequestError,
+    NotFoundError,
+    ProviderError,
+    RateLimitError,
+    SerializationError,
+    StreamError,
+    UnillmError,
+    from_native,
+)
 
 __all__ = [
+    # client + types
     "Client",
     "EventStream",
     "Response",
     "Usage",
+    # exceptions
     "UnillmError",
+    "InvalidRequestError",
+    "AuthenticationError",
+    "NotFoundError",
+    "RateLimitError",
+    "ProviderError",
+    "StreamError",
+    "SerializationError",
+    # helpers
+    "user",
+    "assistant",
+    "system",
+    "tool_result",
+    "image_url",
+    "image_base64",
+    "Cache",
     "from_env",
     "__version__",
 ]
@@ -72,6 +100,9 @@ def _build_request(
     if metadata is not None:
         request["metadata"] = dict(metadata)
     return request
+
+
+# --- typed wrappers -----------------------------------------------------------
 
 
 @dataclass
@@ -148,8 +179,12 @@ class EventStream:
         return self
 
     async def __anext__(self) -> dict[str, Any]:
-        raw = await self._native.__anext__()  # StopAsyncIteration propagates at end of stream
-        return json.loads(raw)
+        try:
+            raw = await self._native.__anext__()  # StopAsyncIteration propagates at end of stream
+        except _NativeUnillmError as e:
+            raise from_native(e) from None
+        event: dict[str, Any] = json.loads(raw)
+        return event
 
     async def collect(self) -> Response:
         """Drain the stream and return the completed `Response`."""
@@ -185,6 +220,10 @@ class Client:
         )
         return cls(provider, api_key, base_url=base_url, timeout=timeout)
 
+    async def aclose(self) -> None:
+        """Release the underlying client. The transport is also released on GC; this is a no-op
+        kept for API parity with the spec."""
+
     async def create(
         self,
         model: str,
@@ -213,7 +252,10 @@ class Client:
             cache=cache,
             metadata=metadata,
         )
-        raw = await self._native.create(json.dumps(request))
+        try:
+            raw = await self._native.create(json.dumps(request))
+        except _NativeUnillmError as e:
+            raise from_native(e) from None
         return Response.from_json(raw)
 
     def stream(
@@ -245,6 +287,59 @@ class Client:
             metadata=metadata,
         )
         return EventStream(self._native.stream(json.dumps(request)))
+
+
+# --- item / content helpers (DESIGN.md §9.1) ---------------------------------
+
+
+def user(content: str | Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """A user message item."""
+    return {"type": "message", "role": "user", "content": content}
+
+
+def assistant(content: str | Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """An assistant message item."""
+    return {"type": "message", "role": "assistant", "content": content}
+
+
+def system(text: str) -> dict[str, Any]:
+    """A system message item."""
+    return {"type": "message", "role": "system", "content": text}
+
+
+def tool_result(call_id: str, output: str) -> dict[str, Any]:
+    """A function-call output item (`call_id` correlates with the `function_call.id`)."""
+    return {"type": "function_call_output", "call_id": call_id, "output": output}
+
+
+def image_url(url: str) -> dict[str, Any]:
+    """An image content block by URL."""
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def image_base64(media_type: str, data: str) -> dict[str, Any]:
+    """An image content block from inline base64 data."""
+    return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+
+
+class Cache:
+    """Cache-strategy builders (`DESIGN.md` §7)."""
+
+    @staticmethod
+    def auto() -> dict[str, Any]:
+        return {"kind": "auto"}
+
+    @staticmethod
+    def none() -> dict[str, Any]:
+        return {"kind": "none"}
+
+    @staticmethod
+    def explicit(breakpoints: Sequence[Mapping[str, Any]], ttl: str = "5m") -> dict[str, Any]:
+        return {
+            "kind": "explicit",
+            "breakpoints": [dict(b) for b in breakpoints],
+            "ttl": ttl,
+        }
 
 
 def from_env() -> Client:
