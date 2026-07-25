@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod inbound;
+pub mod middleware;
 pub mod outbound;
 pub mod route;
 pub mod server;

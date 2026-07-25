@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use unillm_core::ir::{Content, ContentBlock, Item, Response, Role, StopReason};
+use unillm_core::ir::{Content, ContentBlock, Item, Response, Role, StopReason, Usage};
 
 /// Build an Anthropic Messages response body from a canonical [`Response`] (`DESIGN.md` §2.4, §5.4).
 pub fn build_anthropic_response(resp: &Response) -> Value {
@@ -35,13 +35,7 @@ pub fn build_anthropic_response(resp: &Response) -> Value {
         "content": content,
         "stop_reason": anthropic_stop_reason(resp.stop_reason),
         "stop_sequence": Value::Null,
-        "usage": {
-            // Anthropic `input_tokens` excludes cached tokens — matches canonical `input_tokens`.
-            "input_tokens": resp.usage.input_tokens,
-            "output_tokens": resp.usage.output_tokens,
-            "cache_read_input_tokens": resp.usage.cache_read,
-            "cache_creation_input_tokens": resp.usage.cache_creation,
-        }
+        "usage": anthropic_usage(&resp.usage),
     })
 }
 
@@ -58,7 +52,7 @@ fn push_assistant_blocks(content: &Content, out: &mut Vec<Value>) {
     }
 }
 
-fn anthropic_stop_reason(sr: StopReason) -> &'static str {
+pub(crate) fn anthropic_stop_reason(sr: StopReason) -> &'static str {
     match sr {
         StopReason::EndTurn | StopReason::Other => "end_turn",
         StopReason::MaxTokens => "max_tokens",
@@ -67,6 +61,17 @@ fn anthropic_stop_reason(sr: StopReason) -> &'static str {
         StopReason::Refusal => "refusal",
         StopReason::Paused => "pause_turn",
     }
+}
+
+/// The Anthropic `usage` object (shared by the non-stream builder and the stream encoder). Anthropic
+/// `input_tokens` excludes cached tokens, matching canonical `input_tokens`.
+pub(crate) fn anthropic_usage(u: &Usage) -> Value {
+    json!({
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "cache_read_input_tokens": u.cache_read,
+        "cache_creation_input_tokens": u.cache_creation,
+    })
 }
 
 #[cfg(test)]

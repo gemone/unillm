@@ -2,7 +2,7 @@
 
 use serde_json::{Map, Value, json};
 
-use unillm_core::ir::{Content, ContentBlock, Item, Response, Role, StopReason};
+use unillm_core::ir::{Content, ContentBlock, Item, Response, Role, StopReason, Usage};
 
 /// Build a Chat Completions response body from a canonical [`Response`] (`DESIGN.md` §2.2, §5.4).
 pub fn build_cc_response(resp: &Response) -> Value {
@@ -37,9 +37,6 @@ pub fn build_cc_response(resp: &Response) -> Value {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
     }
 
-    let prompt_tokens = resp.usage.total_input();
-    let completion_tokens = resp.usage.output_tokens;
-
     json!({
         "id": resp.id,
         "object": "chat.completion",
@@ -51,12 +48,7 @@ pub fn build_cc_response(resp: &Response) -> Value {
             "message": Value::Object(message),
             "finish_reason": cc_finish_reason(resp.stop_reason),
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-            "prompt_tokens_details": { "cached_tokens": resp.usage.cache_read },
-        }
+        "usage": cc_usage(&resp.usage),
     })
 }
 
@@ -73,7 +65,7 @@ fn append_assistant_text(content: &Content, text: &mut String) {
     }
 }
 
-fn cc_finish_reason(sr: StopReason) -> &'static str {
+pub(crate) fn cc_finish_reason(sr: StopReason) -> &'static str {
     match sr {
         StopReason::EndTurn | StopReason::Paused | StopReason::Other => "stop",
         StopReason::MaxTokens => "length",
@@ -81,6 +73,18 @@ fn cc_finish_reason(sr: StopReason) -> &'static str {
         StopReason::ToolUse => "tool_calls",
         StopReason::Refusal => "content_filter",
     }
+}
+
+/// The Chat Completions `usage` object (shared by the non-stream builder and the stream encoder).
+pub(crate) fn cc_usage(u: &Usage) -> Value {
+    let prompt = u.total_input();
+    let completion = u.output_tokens;
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": { "cached_tokens": u.cache_read },
+    })
 }
 
 #[cfg(test)]

@@ -7,14 +7,21 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
-use crate::{Item, ProviderId, Response};
+use crate::{Item, ProviderId, Response, Usage};
 
 /// Minimal response header emitted at stream creation (`DESIGN.md` §4.9).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally NOT derived: `input_usage` carries `Usage`, which holds an `f64` cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseHeader {
     pub id: String,
     pub model: String,
     pub provider: ProviderId,
+    /// Input/prompt usage known at stream open, when the backend reports it early (Anthropic's
+    /// `message_start`). `None` for backends that report usage only at completion (CC dialect).
+    /// Output token counts are unknown at open; the authoritative totals arrive in `Completed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_usage: Option<Usage>,
 }
 
 /// A canonical streaming event (`DESIGN.md` §4.9). Internally tagged by `type`.

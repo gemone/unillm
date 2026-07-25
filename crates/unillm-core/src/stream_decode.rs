@@ -102,6 +102,8 @@ impl StreamDecoder for CcDecoder {
                     id,
                     model,
                     provider: self.provider,
+                    // CC reports usage only at completion (or [DONE]); none is known at creation.
+                    input_usage: None,
                 },
             });
             out.push(StreamEvent::OutputItemAdded {
@@ -288,11 +290,19 @@ impl StreamDecoder for AnthropicDecoder {
                 if let Some(u) = msg.get("usage") {
                     self.input_usage = u.clone();
                 }
+                // Anthropic reports input usage up-front in `message_start`; surface it on the
+                // header so a same-dialect re-encode can echo it faithfully.
+                let input_usage = if self.input_usage.is_null() {
+                    None
+                } else {
+                    Some(normalize_usage(ProviderId::Anthropic, &self.input_usage))
+                };
                 out.push(StreamEvent::Created {
                     response: ResponseHeader {
                         id,
                         model,
                         provider: ProviderId::Anthropic,
+                        input_usage,
                     },
                 });
             }

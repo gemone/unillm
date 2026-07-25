@@ -11,6 +11,7 @@ use crate::inbound::Format;
 
 pub mod anthropic;
 pub mod cc;
+pub mod stream;
 
 /// Build a native response body in the requested format (`DESIGN.md` §10.4).
 pub fn build_response(format: Format, resp: &Response) -> Value {

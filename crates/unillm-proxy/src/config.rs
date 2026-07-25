@@ -21,6 +21,14 @@ pub struct Config {
     pub bind: SocketAddr,
     pub routes: Routes,
     pub upstreams: HashMap<ProviderId, Upstream>,
+    /// sqlx URL (`sqlite:...` now, `postgres://...` in M4.5). `DESIGN.md` §14.1.
+    pub database_url: String,
+    /// Distinct token gating `/admin/*` (`DESIGN.md` §10.6, §16). `None` disables admin endpoints.
+    pub admin_token: Option<String>,
+    /// Pepper mixed into virtual-key hashes (D11).
+    pub key_pepper: String,
+    /// If set, a dev key with this secret is seeded at startup (broad scopes, no limits).
+    pub seed_key: Option<String>,
 }
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
@@ -61,9 +69,27 @@ pub fn from_env() -> Config {
         }
     }
 
+    let database_url =
+        env::var("UNILLM_DATABASE_URL").unwrap_or_else(|_| "sqlite:unillm.db".into());
+    let admin_token = env::var("UNILLM_ADMIN_TOKEN").ok();
+    let key_pepper = match env::var("UNILLM_KEY_PEPPER") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "WARNING: UNILLM_KEY_PEPPER unset; using insecure default. Set it in production."
+            );
+            "unillm-insecure-dev-pepper".into()
+        }
+    };
+    let seed_key = env::var("UNILLM_SEED_KEY").ok();
+
     Config {
         bind,
         routes: Routes::new(),
         upstreams,
+        database_url,
+        admin_token,
+        key_pepper,
+        seed_key,
     }
 }
