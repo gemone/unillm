@@ -7,6 +7,7 @@
 //! Targeted assertions below additionally pin the load-bearing serde rules so a silent regression
 //! (wrong tag, stringified `input`, etc.) cannot hide behind a passing round-trip.
 
+use pretty_assertions::assert_eq;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use unillm_core::*;
