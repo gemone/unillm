@@ -32,3 +32,7 @@ manifest-path = "crates/unillm-python/Cargo.toml"
 python-source = "python"
 module-name = "unillm._native"
 features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+anyio_mode = "auto"
+testpaths = ["tests/python"]
