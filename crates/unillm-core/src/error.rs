@@ -64,6 +64,22 @@ impl CoreError {
             Self::Serde { .. } | Self::Other { .. } => 500,
         }
     }
+
+    /// Stable machine kind string for this error (e.g. `"rate_limited"`); the single source of
+    /// truth for kind names used by SDKs/proxies to map onto their own error types (`DESIGN.md` §15.1).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::Unauthorized { .. } => "unauthorized",
+            Self::NotFound { .. } => "not_found",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::ProviderError { .. } => "provider_error",
+            Self::Io { .. } => "io",
+            Self::Stream { .. } => "stream",
+            Self::Serde { .. } => "serde",
+            Self::Other { .. } => "other",
+        }
+    }
 }
 
 #[cfg(test)]

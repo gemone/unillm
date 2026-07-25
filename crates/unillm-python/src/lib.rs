@@ -21,21 +21,7 @@ create_exception!(_native, UnillmError, PyException);
 
 /// Map a `CoreError` onto the `UnillmError` Python exception (kind + message).
 fn map_core_err(e: CoreError) -> PyErr {
-    UnillmError::new_err(format!("{}: {e}", core_kind(&e)))
-}
-
-fn core_kind(e: &CoreError) -> &'static str {
-    match e {
-        CoreError::InvalidRequest { .. } => "invalid_request",
-        CoreError::Unauthorized { .. } => "unauthorized",
-        CoreError::NotFound { .. } => "not_found",
-        CoreError::RateLimited { .. } => "rate_limited",
-        CoreError::ProviderError { .. } => "provider_error",
-        CoreError::Io { .. } => "io",
-        CoreError::Stream { .. } => "stream",
-        CoreError::Serde { .. } => "serde",
-        CoreError::Other { .. } => "other",
-    }
+    UnillmError::new_err(format!("{}: {e}", e.kind()))
 }
 
 fn parse_provider(s: &str) -> Result<ProviderId, PyErr> {
@@ -116,7 +102,7 @@ struct Running {
 #[pyclass(name = "EventStream")]
 struct EventStream {
     core: Arc<CoreClient>,
-    req: Request,
+    req: Arc<Request>,
     running: Arc<Mutex<Option<Running>>>,
 }
 
@@ -124,7 +110,7 @@ impl EventStream {
     fn new(core: Arc<CoreClient>, req: Request) -> Self {
         Self {
             core,
-            req,
+            req: Arc::new(req),
             running: Arc::new(Mutex::new(None)),
         }
     }
@@ -172,7 +158,7 @@ impl EventStream {
 
 /// Drain the upstream stream into the channel. Exits when the stream ends, errors, or the receiver
 /// is dropped (consumer went away) — closing the upstream connection.
-async fn drain(core: Arc<CoreClient>, req: Request, tx: mpsc::Sender<Result<String, PyErr>>) {
+async fn drain(core: Arc<CoreClient>, req: Arc<Request>, tx: mpsc::Sender<Result<String, PyErr>>) {
     let mut stream = match core.stream(&req).await {
         Ok(s) => s,
         Err(e) => {

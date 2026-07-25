@@ -1,7 +1,10 @@
 # Rust
-/target
+target/
 **/*.rs.bk
 *.pdb
+# The PyO3 bindings crate is excluded from the workspace and built by maturin; its lock + target
+# are build artifacts, not source.
+crates/unillm-python/Cargo.lock
 
 # Python
 __pycache__/
