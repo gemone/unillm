@@ -363,7 +363,8 @@ Tagged union (`type` discriminator):
 
 ### 4.5 `ToolChoice`
 
-Externally tagged (`type`):
+Internally tagged by `type` (so `auto` serializes as `{"type":"auto"}` and `named` as
+`{"type":"named","name":…}` — matching the §4.11 example):
 `auto` | `none` | `required` | `named { name }`.
 
 ### 4.6 `Response`
