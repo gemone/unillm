@@ -11,6 +11,7 @@ pub mod provider;
 pub mod providers;
 pub mod sse;
 pub mod stream;
+pub mod stream_decode;
 
 pub use cache::normalize_usage;
 pub use error::CoreError;
@@ -22,3 +23,6 @@ pub use provider::{Dialect, Provider, ProviderConfig};
 pub use providers::{Anthropic, ChatCompletions};
 pub use sse::{SseFrame, SseParser, parse_sse};
 pub use stream::{ResponseHeader, StreamEvent};
+pub use stream_decode::{
+    AnthropicDecoder, CcDecoder, StreamDecoder, decode_all, decode_anthropic, decode_cc,
+};
