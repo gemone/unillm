@@ -105,10 +105,14 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Err(e) => return error_response(&e),
     };
     if canonical.stream {
-        // Streaming arrives in M3.4.
-        return error_response(&CoreError::Other {
-            message: "streaming is not implemented yet".into(),
-        });
+        // Streaming arrives in M3.4; until then this is genuinely Not Implemented (not a 500).
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "error": { "kind": "not_implemented", "message": "streaming is not implemented yet" }
+            })),
+        )
+            .into_response();
     }
     let outbound = pick_outbound(inbound, response_format_header.as_deref());
 

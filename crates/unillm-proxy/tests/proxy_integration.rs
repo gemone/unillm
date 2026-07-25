@@ -197,3 +197,24 @@ async fn unknown_alias_is_not_found() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+#[tokio::test]
+async fn stream_request_returns_501_until_m4() {
+    let mut routes = Routes::new();
+    routes.insert("gpt-4o", Route::single(ProviderId::Openai, "gpt-4o"));
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, "http://127.0.0.1:1".into()),
+    );
+    let url = start_proxy(routes, clients).await;
+
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    // Streaming is M3.4; until then it's Not Implemented (not a 500).
+    assert_eq!(resp.status(), 501);
+}
