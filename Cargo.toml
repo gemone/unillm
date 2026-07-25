@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/unillm-core"]
+# The PyO3 cdylib is built by maturin, not plain cargo; exclude it so `cargo test/clippy
+# --workspace` stays fast and doesn't need libpython at link time.
+exclude = ["crates/unillm-python"]
 
 [workspace.package]
 version = "0.1.0"
