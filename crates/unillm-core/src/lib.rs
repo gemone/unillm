@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod ir;
+pub mod sse;
 pub mod stream;
 
 pub use error::CoreError;
@@ -13,4 +14,5 @@ pub use ir::{
     Breakpoint, CacheControl, CacheStrategy, Content, ContentBlock, ImageSource, Item, ModelRef,
     ProviderId, Request, Response, Role, StopReason, ToolChoice, ToolDef, Ttl, Usage,
 };
+pub use sse::{SseFrame, SseParser, parse_sse};
 pub use stream::{ResponseHeader, StreamEvent};
