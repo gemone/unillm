@@ -37,7 +37,7 @@ pub fn build_cc_response(resp: &Response) -> Value {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
     }
 
-    let prompt_tokens = resp.usage.input_tokens + resp.usage.cache_read + resp.usage.cache_creation;
+    let prompt_tokens = resp.usage.total_input();
     let completion_tokens = resp.usage.output_tokens;
 
     json!({
