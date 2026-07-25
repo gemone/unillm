@@ -6,21 +6,25 @@
 
 pub mod cache;
 pub mod error;
+pub mod http;
 pub mod ir;
 pub mod provider;
 pub mod providers;
+pub mod retry;
 pub mod sse;
 pub mod stream;
 pub mod stream_decode;
 
 pub use cache::normalize_usage;
 pub use error::CoreError;
+pub use http::Client;
 pub use ir::{
     Breakpoint, CacheControl, CacheStrategy, Content, ContentBlock, ImageSource, Item, ModelRef,
     ProviderId, Request, Response, Role, StopReason, ToolChoice, ToolDef, Ttl, Usage,
 };
 pub use provider::{Dialect, Provider, ProviderConfig};
 pub use providers::{Anthropic, ChatCompletions};
+pub use retry::RetryPolicy;
 pub use sse::{SseFrame, SseParser, parse_sse};
 pub use stream::{ResponseHeader, StreamEvent};
 pub use stream_decode::{
