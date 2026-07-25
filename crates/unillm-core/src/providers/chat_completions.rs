@@ -10,10 +10,9 @@ use serde_json::{Value, json};
 use crate::cache::normalize_usage;
 use crate::error::CoreError;
 use crate::ir::{
-    Content, ContentBlock, ImageSource, Item, ModelRef, Request, Response, Role, StopReason,
-    ToolChoice,
+    Content, ContentBlock, ImageSource, Item, Request, Response, Role, StopReason, ToolChoice,
 };
-use crate::provider::Provider;
+use crate::provider::{Provider, f32_to_value, model_string};
 
 /// The Chat Completions dialect adapter, parameterized by the concrete provider (for usage quirks).
 pub struct ChatCompletions {
@@ -206,13 +205,6 @@ fn build_messages(req: &Request) -> Vec<Value> {
     messages
 }
 
-fn model_string(m: &ModelRef) -> String {
-    match m {
-        ModelRef::Alias(s) => s.clone(),
-        ModelRef::Explicit { model, .. } => model.clone(),
-    }
-}
-
 fn role_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",
@@ -307,16 +299,6 @@ fn parse_part(p: &Value) -> ContentBlock {
                 .to_string(),
             cache_control: None,
         },
-    }
-}
-
-/// Format an `f32` cleanly as a JSON number. Storing it in a `serde_json::Value` goes via `f64`,
-/// which injects representation noise (e.g. `0.7f32` → `0.699999988079071`). Round-tripping through
-/// the shortest `f32` string keeps provider payloads tidy.
-fn f32_to_value(x: f32) -> Value {
-    match format!("{x}").parse::<f64>() {
-        Ok(n) => Value::from(n),
-        Err(_) => Value::Null,
     }
 }
 

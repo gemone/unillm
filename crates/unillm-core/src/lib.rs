@@ -19,6 +19,6 @@ pub use ir::{
     ProviderId, Request, Response, Role, StopReason, ToolChoice, ToolDef, Ttl, Usage,
 };
 pub use provider::{Dialect, Provider, ProviderConfig};
-pub use providers::ChatCompletions;
+pub use providers::{Anthropic, ChatCompletions};
 pub use sse::{SseFrame, SseParser, parse_sse};
 pub use stream::{ResponseHeader, StreamEvent};

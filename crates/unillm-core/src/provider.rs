@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::error::CoreError;
-use crate::ir::{ProviderId, Request, Response};
+use crate::ir::{ModelRef, ProviderId, Request, Response};
 
 /// A provider wire-format family (`DESIGN.md` §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,4 +69,22 @@ pub trait Provider: Send + Sync {
     fn dialect(&self) -> Dialect;
     fn build_payload(&self, req: &Request) -> Value;
     fn parse_response(&self, body: &Value) -> Result<Response, CoreError>;
+}
+
+/// The wire model string for a [`ModelRef`] — the alias, or the explicit pair's model (`DESIGN.md` §4.1).
+pub(crate) fn model_string(m: &ModelRef) -> String {
+    match m {
+        ModelRef::Alias(s) => s.clone(),
+        ModelRef::Explicit { model, .. } => model.clone(),
+    }
+}
+
+/// Format an `f32` cleanly as a JSON number. Storing it in a `serde_json::Value` goes via `f64`,
+/// which injects representation noise (e.g. `0.7f32` → `0.699999988079071`). Round-tripping through
+/// the shortest `f32` string keeps provider payloads tidy.
+pub(crate) fn f32_to_value(x: f32) -> Value {
+    match format!("{x}").parse::<f64>() {
+        Ok(n) => Value::from(n),
+        Err(_) => Value::Null,
+    }
 }
