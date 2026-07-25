@@ -1155,9 +1155,11 @@ dependencies = [
 name = "unillm-python"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "pyo3",
  "pyo3-async-runtimes",
  "serde_json",
+ "tokio",
  "unillm-core",
 ]
 

@@ -13,10 +13,19 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from ._native import Client as _NativeClient
+from ._native import EventStream as _NativeEventStream
 from ._native import UnillmError
 from ._native import __version__
 
-__all__ = ["Client", "Response", "Usage", "UnillmError", "from_env", "__version__"]
+__all__ = [
+    "Client",
+    "EventStream",
+    "Response",
+    "Usage",
+    "UnillmError",
+    "from_env",
+    "__version__",
+]
 
 
 def _build_input(
@@ -27,6 +36,42 @@ def _build_input(
     if isinstance(input_, str):
         return [{"type": "message", "role": "user", "content": input_}]
     return [dict(item) for item in input_]
+
+
+def _build_request(
+    model: str,
+    *,
+    instructions: str | None,
+    input: str | Sequence[Mapping[str, Any]] | None,
+    max_tokens: int | None,
+    temperature: float | None,
+    top_p: float | None,
+    stop: Sequence[str] | None,
+    tools: Sequence[Mapping[str, Any]] | None,
+    tool_choice: Mapping[str, Any] | None,
+    cache: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {"model": model, "input": _build_input(input)}
+    if instructions is not None:
+        request["instructions"] = instructions
+    if max_tokens is not None:
+        request["max_tokens"] = max_tokens
+    if temperature is not None:
+        request["temperature"] = temperature
+    if top_p is not None:
+        request["top_p"] = top_p
+    if stop is not None:
+        request["stop"] = list(stop)
+    if tools is not None:
+        request["tools"] = [dict(t) for t in tools]
+    if tool_choice is not None:
+        request["tool_choice"] = dict(tool_choice)
+    if cache is not None:
+        request["cache"] = dict(cache)
+    if metadata is not None:
+        request["metadata"] = dict(metadata)
+    return request
 
 
 @dataclass
@@ -52,8 +97,7 @@ class Response:
     usage: Usage
 
     @classmethod
-    def from_json(cls, raw: str) -> "Response":
-        d = json.loads(raw)
+    def from_dict(cls, d: Mapping[str, Any]) -> "Response":
         usage = d.get("usage") or {}
         return cls(
             id=d.get("id", ""),
@@ -69,6 +113,10 @@ class Response:
                 cost_usd=usage.get("cost_usd"),
             ),
         )
+
+    @classmethod
+    def from_json(cls, raw: str) -> "Response":
+        return cls.from_dict(json.loads(raw))
 
     @property
     def text(self) -> str:
@@ -88,6 +136,30 @@ class Response:
     @property
     def tool_calls(self) -> list[Mapping[str, Any]]:
         return [i for i in self.output if i.get("type") == "function_call"]
+
+
+class EventStream:
+    """Async iterator of canonical stream-event dicts, with a ``.collect()`` helper."""
+
+    def __init__(self, native: _NativeEventStream) -> None:
+        self._native = native
+
+    def __aiter__(self) -> "EventStream":
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        raw = await self._native.__anext__()  # StopAsyncIteration propagates at end of stream
+        return json.loads(raw)
+
+    async def collect(self) -> Response:
+        """Drain the stream and return the completed `Response`."""
+        completed: Mapping[str, Any] | None = None
+        async for event in self:
+            if event.get("type") == "completed":
+                completed = event.get("response")
+        if completed is None:
+            raise UnillmError("stream ended without a completed event")
+        return Response.from_dict(completed)
 
 
 class Client:
@@ -128,25 +200,53 @@ class Client:
         cache: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> Response:
-        request: dict[str, Any] = {"model": model, "input": _build_input(input)}
-        if instructions is not None:
-            request["instructions"] = instructions
-        if max_tokens is not None:
-            request["max_tokens"] = max_tokens
-        if temperature is not None:
-            request["temperature"] = temperature
-        if top_p is not None:
-            request["top_p"] = top_p
-        if stop is not None:
-            request["stop"] = list(stop)
-        if tools is not None:
-            request["tools"] = [dict(t) for t in tools]
-        if tool_choice is not None:
-            request["tool_choice"] = dict(tool_choice)
-        if cache is not None:
-            request["cache"] = dict(cache)
-        if metadata is not None:
-            request["metadata"] = dict(metadata)
-
+        request = _build_request(
+            model,
+            instructions=instructions,
+            input=input,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            tools=tools,
+            tool_choice=tool_choice,
+            cache=cache,
+            metadata=metadata,
+        )
         raw = await self._native.create(json.dumps(request))
         return Response.from_json(raw)
+
+    def stream(
+        self,
+        model: str,
+        *,
+        instructions: str | None = None,
+        input: str | Sequence[Mapping[str, Any]] | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        stop: Sequence[str] | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        tool_choice: Mapping[str, Any] | None = None,
+        cache: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> EventStream:
+        request = _build_request(
+            model,
+            instructions=instructions,
+            input=input,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            tools=tools,
+            tool_choice=tool_choice,
+            cache=cache,
+            metadata=metadata,
+        )
+        return EventStream(self._native.stream(json.dumps(request)))
+
+
+def from_env() -> Client:
+    """Convenience: ``Client.from_env()``."""
+    return Client.from_env()
