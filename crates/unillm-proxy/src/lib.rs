@@ -6,5 +6,7 @@
 //! transforms, and middleware arrive in later M3 slices.
 
 pub mod inbound;
+pub mod outbound;
 
 pub use inbound::{Format, detect_format, parse_request};
+pub use outbound::build_response;
