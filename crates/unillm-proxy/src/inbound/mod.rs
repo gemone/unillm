@@ -60,6 +60,31 @@ pub fn parse_request(format: Format, body: &Value) -> Result<Request, CoreError>
     }
 }
 
+/// Read a string field, defaulting to `""` (shared by the dialect parsers).
+pub(super) fn s(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Extract the sampling params shared by the CC and Anthropic request shapes (`max_tokens`,
+/// `temperature`, `top_p`, `stream` — identical field names in both).
+pub(super) fn sampling(body: &Value) -> (Option<u32>, Option<f32>, Option<f32>, bool) {
+    (
+        body.get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|x| x as u32),
+        body.get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|x| x as f32),
+        body.get("top_p").and_then(|v| v.as_f64()).map(|x| x as f32),
+        body.get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

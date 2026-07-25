@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::{s, sampling};
 use unillm_core::ir::{
     Content, ContentBlock, ImageSource, Item, ModelRef, Request, Role, ToolChoice, ToolDef,
 };
@@ -72,39 +73,24 @@ pub fn parse_cc_request(body: &Value) -> Result<Request, unillm_core::CoreError>
         }
     }
 
+    let (max_tokens, temperature, top_p, stream) = sampling(body);
     Ok(Request {
         model: ModelRef::Alias(model.to_string()),
         instructions: None,
         input,
-        max_tokens: body
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|x| x as u32),
-        temperature: body
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .map(|x| x as f32),
-        top_p: body.get("top_p").and_then(|v| v.as_f64()).map(|x| x as f32),
+        max_tokens,
+        temperature,
+        top_p,
         stop: body.get("stop").map(parse_stop),
         tools: body
             .get("tools")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(parse_tool).collect()),
         tool_choice: body.get("tool_choice").map(parse_tool_choice),
-        stream: body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        stream,
         cache: unillm_core::CacheStrategy::Auto,
         metadata: HashMap::new(),
     })
-}
-
-fn s(v: &Value, key: &str) -> String {
-    v.get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
 }
 
 fn parse_stop(v: &Value) -> Vec<String> {
