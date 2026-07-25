@@ -4,15 +4,21 @@
 //! (`DESIGN.md` §3). This milestone (M0) implements the canonical data model (`DESIGN.md` §4) and
 //! error catalog (`DESIGN.md` §15); provider adapters, the SSE codec, and cache logic arrive in M1.
 
+pub mod cache;
 pub mod error;
 pub mod ir;
+pub mod provider;
+pub mod providers;
 pub mod sse;
 pub mod stream;
 
+pub use cache::normalize_usage;
 pub use error::CoreError;
 pub use ir::{
     Breakpoint, CacheControl, CacheStrategy, Content, ContentBlock, ImageSource, Item, ModelRef,
     ProviderId, Request, Response, Role, StopReason, ToolChoice, ToolDef, Ttl, Usage,
 };
+pub use provider::{Dialect, Provider, ProviderConfig};
+pub use providers::ChatCompletions;
 pub use sse::{SseFrame, SseParser, parse_sse};
 pub use stream::{ResponseHeader, StreamEvent};
