@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "Pluggable storage backends for unillm-proxy (keys, models, routes, logs)"
 
+[features]
+default = []
+# Enable the PostgreSQL backend (`PostgresStore`) + its sqlx integration. The SQLite backend is
+# always available; `postgres` adds the parallel PG backend for the cross-DB gate.
+postgres = ["sqlx/postgres", "sqlx/uuid"]
+
 [dependencies]
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",

@@ -56,6 +56,29 @@ pub struct NewVirtualKey {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// A partial update to a virtual key (`DESIGN.md` §10.6 `PATCH /admin/keys/:id`). Each field is
+/// applied only when `Some`; `None` leaves the column unchanged. `revoked = Some(true)` marks the
+/// key revoked (`Some(false)` clears it).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateKey {
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub model_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub budget_daily_tokens: Option<i64>,
+    #[serde(default)]
+    pub rpm: Option<i32>,
+    #[serde(default)]
+    pub tpm: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i32>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revoked: Option<bool>,
+}
+
 /// A model-catalog row (`DESIGN.md` §11.3 `models`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRow {
@@ -108,4 +131,90 @@ pub struct NewRoute {
     pub fallback: Vec<FallbackTarget>,
     pub priority: i32,
     pub enabled: bool,
+}
+
+/// A request-log row (`DESIGN.md` §11.3 `request_logs`). Per §16 PII hygiene, **no request or
+/// response bodies are stored** — only metadata + sizes; token usage lives in the associated
+/// `usage` row (written via [`NewUsage`]). Logging happens only for authenticated data-plane
+/// requests (after §10.3 step 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestLog {
+    pub id: Uuid,
+    pub request_id: String,
+    pub virtual_key_id: Uuid,
+    pub tenant_id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub inbound_format: String,
+    pub outbound_format: String,
+    /// HTTP status returned to the client.
+    pub status: i16,
+    /// `false` until the exact-hash cache lands (M5).
+    pub cached: bool,
+    pub latency_ms: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Input for inserting a request log. The store assigns `id`/`created_at`.
+#[derive(Debug, Clone)]
+pub struct NewRequestLog {
+    pub request_id: String,
+    pub virtual_key_id: Uuid,
+    pub tenant_id: Uuid,
+    pub provider: String,
+    pub model: String,
+    pub inbound_format: String,
+    pub outbound_format: String,
+    pub status: i16,
+    pub latency_ms: Option<i32>,
+}
+
+/// Actual token usage to record alongside a request log (`DESIGN.md` §13.5).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NewUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read: i64,
+    pub cache_creation: i64,
+    pub cost_usd: Option<f64>,
+}
+
+/// Aggregation dimension for usage analytics (`DESIGN.md` §13.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    /// Group by virtual key.
+    Key,
+    /// Group by requested model.
+    Model,
+    /// Group by upstream provider.
+    Provider,
+    /// Group by calendar day (UTC).
+    Day,
+}
+
+impl GroupBy {
+    /// Parse the `group_by` query-param value (`key`/`model`/`provider`/`day`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "key" => Some(Self::Key),
+            "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
+            "day" => Some(Self::Day),
+            _ => None,
+        }
+    }
+}
+
+/// One row of an aggregated usage query (`DESIGN.md` §13.5). `key` is the grouping value
+/// (`virtual_key_id` / `model` / `provider` / `day`, ISO date); `None` for an ungrouped total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageBucket {
+    pub key: Option<String>,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read: i64,
+    pub cache_creation: i64,
+    pub cost_usd: Option<f64>,
 }

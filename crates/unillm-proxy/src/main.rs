@@ -6,11 +6,14 @@ use std::sync::Arc;
 
 use unillm_core::{Client as CoreClient, ProviderConfig};
 use unillm_storage::{
-    InMemoryRateLimiter, KeyStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore, hash_secret,
-    key_prefix,
+    InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore,
+    hash_secret, key_prefix,
 };
 use uuid::Uuid;
 
+use clap::Parser;
+
+use unillm_proxy::cli::{Cli, TopCmd};
 use unillm_proxy::config;
 use unillm_proxy::server::{AppState, Stores, build_app};
 
@@ -19,6 +22,20 @@ const SEED_SCOPES: &[&str] = &["data", "admin", "read-usage"];
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(TopCmd::Admin { cmd }) => {
+            if let Err(e) = unillm_proxy::cli::run_admin(cmd).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(TopCmd::Serve) | None => serve().await,
+    }
+}
+
+/// Load config, open storage + seed a dev key, build per-provider backend clients, and serve.
+async fn serve() {
     let cfg = config::from_env();
 
     let store = match SqliteStore::connect(&cfg.database_url).await {
@@ -75,11 +92,13 @@ async fn main() {
 
     let keys: Arc<dyn KeyStore> = store.clone();
     let routes: Arc<dyn RouteStore> = store.clone();
-    let models: Arc<dyn ModelStore> = store;
+    let models: Arc<dyn ModelStore> = store.clone();
+    let logs: Arc<dyn LogStore> = store;
     let stores = Stores {
         keys,
         routes,
         models,
+        logs,
         rate_limiter: Arc::new(InMemoryRateLimiter::new()),
     };
     let state = AppState::new(clients, stores, cfg.key_pepper, cfg.admin_token, cfg.limits);

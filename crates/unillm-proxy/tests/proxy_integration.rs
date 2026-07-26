@@ -15,8 +15,8 @@ use unillm_proxy::config::RequestLimits;
 use unillm_proxy::server::{AppState, Stores, build_app};
 use unillm_storage::model::FallbackTarget;
 use unillm_storage::{
-    InMemoryRateLimiter, KeyStore, ModelStore, NewModel, NewRoute, NewVirtualKey, RouteStore,
-    SqliteStore,
+    InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewModel, NewRoute, NewVirtualKey,
+    RequestLog, RouteStore, SqliteStore,
 };
 
 const PEPPER: &str = "test-pepper";
@@ -122,11 +122,13 @@ async fn start_proxy(
 ) -> String {
     let keys: Arc<dyn KeyStore> = store.clone();
     let routes: Arc<dyn RouteStore> = store.clone();
-    let models: Arc<dyn ModelStore> = store;
+    let models: Arc<dyn ModelStore> = store.clone();
+    let logs: Arc<dyn LogStore> = store;
     let stores = Stores {
         keys,
         routes,
         models,
+        logs,
         rate_limiter: Arc::new(InMemoryRateLimiter::new()),
     };
     let app = build_app(AppState::new(
@@ -365,24 +367,6 @@ async fn admin_rejects_data_key_as_admin() {
             .status(),
         401
     );
-}
-
-#[tokio::test]
-async fn admin_token_passes_then_404s() {
-    let url = start_proxy(
-        HashMap::new(),
-        mem_store().await,
-        Some("admin-secret".into()),
-        default_limits(),
-    )
-    .await;
-    let resp = http()
-        .get(format!("{url}/admin/keys"))
-        .header("authorization", "Bearer admin-secret")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 404);
 }
 
 // --- validation: caps + allowlist + catalog (M4.3) -------------------------------
@@ -1120,4 +1104,412 @@ async fn stream_slot_released_after_completion() {
         .await
         .unwrap();
     assert_eq!(r2.status(), 200);
+}
+
+// --- M4.5 logging -------------------------------------------------------------
+
+/// Poll until at least one request log exists (the write is fire-and-forget).
+async fn await_log(store: &SqliteStore) -> Vec<RequestLog> {
+    for _ in 0..100 {
+        let logs = store.list_logs(None, None, 10).await.unwrap();
+        if !logs.is_empty() {
+            return logs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no request log written within ~1s");
+}
+
+#[tokio::test]
+async fn data_plane_logs_request_and_usage() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    // Priced model so the logger computes a cost from the catalog.
+    store
+        .upsert_model(NewModel {
+            provider: "openai".into(),
+            native_model: "gpt-4o".into(),
+            display_name: "GPT-4o".into(),
+            context_window: None,
+            max_output: None,
+            price_in: Some(2.0),
+            price_out: Some(6.0),
+            price_cache_read: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    // Keep a store handle for assertions (the proxy gets a clone of the same pool).
+    let url = start_proxy(clients, store.clone(), None, default_limits()).await;
+
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let logs = await_log(&store).await;
+    assert_eq!(logs.len(), 1);
+    let log = &logs[0];
+    assert_eq!(log.status, 200);
+    assert_eq!(log.provider, "openai");
+    assert_eq!(log.model, "gpt-4o");
+    assert_eq!(log.inbound_format, "openai_chat");
+    assert_eq!(log.outbound_format, "openai_chat");
+    assert!(!log.cached);
+    assert!(log.latency_ms.is_some());
+
+    // Usage + cost: input 10 × $2/1M + output 5 × $6/1M = $0.00005.
+    let usage = store
+        .usage_summary(None, None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].requests, 1);
+    assert_eq!(usage[0].input_tokens, 10);
+    assert_eq!(usage[0].output_tokens, 5);
+    let cost = usage[0].cost_usd.expect("cost computed from catalog");
+    assert!((cost - 0.00005).abs() < 1e-9, "cost was {cost}");
+}
+
+#[tokio::test]
+async fn stream_logs_request_at_completion() {
+    let upstream = MockServer::start().await;
+    mount_sse(&upstream, "/chat/completions", CC_SSE).await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store.clone(), None, default_limits()).await;
+
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    // Drain the body: the generator runs to completion, which fires the log write.
+    let _ = resp.text().await.unwrap();
+
+    let logs = await_log(&store).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, 200);
+    assert_eq!(logs[0].provider, "openai");
+}
+
+// --- M4.5 admin REST ----------------------------------------------------------
+
+const ADMIN: &str = "admin-secret";
+
+fn admin_hdr() -> reqwest::header::HeaderValue {
+    reqwest::header::HeaderValue::from_str(&format!("Bearer {ADMIN}")).unwrap()
+}
+
+#[tokio::test]
+async fn admin_requires_token() {
+    let url = start_proxy(
+        HashMap::new(),
+        mem_store().await,
+        Some(ADMIN.into()),
+        default_limits(),
+    )
+    .await;
+    // No token → 401.
+    let r = http()
+        .get(format!("{url}/admin/keys"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    // Wrong token → 401.
+    let r = http()
+        .get(format!("{url}/admin/keys"))
+        .header("authorization", "Bearer wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    // Correct token → 200 (empty list).
+    let r = http()
+        .get(format!("{url}/admin/keys"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+}
+
+/// Gate (§M4.5): create a key via admin → call the data plane → request logged + usage recorded →
+/// `/admin/usage` and `/admin/logs` return the row.
+#[tokio::test]
+async fn admin_end_to_end_create_call_usage() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    let url = start_proxy(clients, store.clone(), Some(ADMIN.into()), default_limits()).await;
+    let tenant = Uuid::new_v4();
+
+    // Seed a route via admin.
+    let r = http()
+        .post(format!("{url}/admin/routes"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"alias": "gpt-4o", "provider": "openai", "native_model": "gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // Create a key via admin; capture the one-time secret.
+    let r = http()
+        .post(format!("{url}/admin/keys"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"tenant_id": tenant, "scopes": ["data"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let key: Value = r.json().await.unwrap();
+    let secret = key["key"].as_str().unwrap().to_string();
+    assert!(!secret.is_empty());
+
+    // Use it on the data plane.
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    await_log(&store).await; // wait for the fire-and-forget write
+
+    // /admin/usage returns the aggregated row.
+    let r = http()
+        .get(format!("{url}/admin/usage"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let buckets: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0]["requests"], 1);
+    assert_eq!(buckets[0]["input_tokens"], 7);
+    assert_eq!(buckets[0]["output_tokens"], 3);
+
+    // /admin/logs returns the request row.
+    let r = http()
+        .get(format!("{url}/admin/logs"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let logs: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0]["status"], 200);
+    assert_eq!(logs[0]["model"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn admin_keys_crud() {
+    let store = mem_store().await;
+    let url = start_proxy(
+        HashMap::new(),
+        store.clone(),
+        Some(ADMIN.into()),
+        default_limits(),
+    )
+    .await;
+    let tenant = Uuid::new_v4();
+
+    let r = http()
+        .post(format!("{url}/admin/keys"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"tenant_id": tenant, "scopes": ["data"], "rpm": 10}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let key: Value = r.json().await.unwrap();
+    let id = Uuid::parse_str(key["id"].as_str().unwrap()).unwrap();
+
+    let r = http()
+        .get(format!("{url}/admin/keys"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["rpm"], 10);
+    assert!(list[0]["key"].is_null()); // secret never returned on list
+
+    // PATCH updates scopes.
+    let r = http()
+        .patch(format!("{url}/admin/keys/{id}"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"scopes": ["data", "read-usage"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let updated: Value = r.json().await.unwrap();
+    assert!(
+        updated["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "read-usage")
+    );
+
+    // DELETE revokes (sets revoked_at).
+    let r = http()
+        .delete(format!("{url}/admin/keys/{id}"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let r = http()
+        .get(format!("{url}/admin/keys"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert!(list[0]["revoked_at"].is_string());
+}
+
+#[tokio::test]
+async fn admin_models_crud() {
+    let store = mem_store().await;
+    let url = start_proxy(
+        HashMap::new(),
+        store.clone(),
+        Some(ADMIN.into()),
+        default_limits(),
+    )
+    .await;
+
+    let r = http()
+        .post(format!("{url}/admin/models"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"provider": "openai", "native_model": "gpt-test", "display_name": "Test", "price_in": 1.0, "price_out": 2.0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = http()
+        .get(format!("{url}/admin/models"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(list.len(), 1);
+
+    let r = http()
+        .delete(format!("{url}/admin/models/openai/gpt-test"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let r = http()
+        .get(format!("{url}/admin/models"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert!(list.is_empty());
+}
+
+#[tokio::test]
+async fn admin_routes_crud() {
+    let store = mem_store().await;
+    let url = start_proxy(
+        HashMap::new(),
+        store.clone(),
+        Some(ADMIN.into()),
+        default_limits(),
+    )
+    .await;
+
+    let r = http()
+        .post(format!("{url}/admin/routes"))
+        .header("authorization", admin_hdr())
+        .json(&json!({"alias": "gpt-4o", "provider": "openai", "native_model": "gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    let r = http()
+        .get(format!("{url}/admin/routes"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert_eq!(list.len(), 1);
+
+    let r = http()
+        .delete(format!("{url}/admin/routes/gpt-4o"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let r = http()
+        .get(format!("{url}/admin/routes"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let list: Vec<Value> = r.json().await.unwrap();
+    assert!(list.is_empty());
 }

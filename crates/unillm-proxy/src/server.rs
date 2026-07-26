@@ -5,17 +5,19 @@
 //! (allowlist + catalog) → walk the (primary, fallbacks) chain calling the backend `Client` →
 //! translate the response into the client's outbound format. Streaming requests are re-translated
 //! event-by-event (`DESIGN.md` §10.5); the rate-limit concurrency slot releases when the stream
-//! ends or the client drops. Request/usage logging (M4.5) is not yet wired.
+//! ends or the client drops. Each request is logged (metadata + usage only, no bodies) via a
+//! fire-and-forget write (`DESIGN.md` §10.3 step 9, §16).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{BoxStream, StreamExt};
 use serde_json::Value;
@@ -25,16 +27,15 @@ use unillm_core::retry::RetryPolicy;
 use unillm_core::stream::StreamEvent;
 use unillm_core::{Client as CoreClient, CoreError, ProviderId};
 use unillm_storage::{
-    KeyLimits, KeyStore, ModelStore, RateDecision, RateHeaders, RateLimiter, RouteStore,
+    KeyLimits, KeyStore, LogStore, ModelStore, RateDecision, RateHeaders, RateLimiter, RouteStore,
     TokenActual, VirtualKey,
 };
 use uuid::Uuid;
 
 use crate::config::RequestLimits;
 use crate::inbound::{Format, detect_format, parse_request};
-use crate::middleware::auth::{
-    authenticate, extract_token, reject_query_key, require_admin, require_scope,
-};
+use crate::middleware::auth::{authenticate, extract_token, reject_query_key, require_scope};
+use crate::middleware::log::{LogContext, StreamLogger, spawn_log, usage_from};
 use crate::middleware::rate_limit::{
     ReleaseGuard, apply_rate_headers, estimate_tokens, rate_limited_response,
 };
@@ -44,12 +45,13 @@ use crate::route::{RouteTarget, row_to_chain};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// The storage + limits layer: the four pluggable trait-object backends held by [`AppState`].
+/// The storage + limits layer: the pluggable trait-object backends held by [`AppState`].
 #[derive(Clone)]
 pub struct Stores {
     pub keys: Arc<dyn KeyStore>,
     pub routes: Arc<dyn RouteStore>,
     pub models: Arc<dyn ModelStore>,
+    pub logs: Arc<dyn LogStore>,
     pub rate_limiter: Arc<dyn RateLimiter>,
 }
 
@@ -88,23 +90,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/chat/completions", post(proxy))
         .route("/v1/messages", post(proxy))
         .route("/unillm/v1/responses", post(proxy))
-        .route("/admin/{*rest}", any(admin_gate))
+        .merge(crate::admin::router(state.clone()))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .with_state(state)
-}
-
-/// Admin gate (`/admin/*`, `DESIGN.md` §10.6, §16): requires the distinct admin token — a data-plane
-/// virtual key never satisfies it. The REST routes themselves arrive in M4.5; until then an
-/// authenticated admin request 404s.
-async fn admin_gate(State(state): State<AppState>, req: Request) -> Response {
-    let token = extract_token(req.headers());
-    match require_admin(token.as_deref(), &state.admin_token) {
-        Ok(()) => error_response(&CoreError::NotFound {
-            message: "admin routes arrive in M4.5".into(),
-        }),
-        Err(e) => error_response(&e),
-    }
 }
 
 async fn health() -> impl IntoResponse {
@@ -124,6 +113,7 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 /// The universal translator handler (`DESIGN.md` §10.3).
 async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
+    let started = Instant::now();
     // §16: never accept API keys as query parameters.
     if let Err(e) = reject_query_key(req.uri()) {
         return error_response(&e);
@@ -211,15 +201,30 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     if let Err(e) = check_catalog_enabled(&*state.stores.models, &chain[0]).await {
         return error_response(&e);
     }
+
+    // Request/usage logging context (§10.3 step 9): metadata only, no bodies. The provider/model
+    // default to the resolved primary; the non-stream walk overrides them with the target that
+    // actually answered. `virtual_key_id` carries `key.id` for the rate-limit/stream paths.
+    let log_ctx = LogContext {
+        request_id: Uuid::new_v4().to_string(),
+        virtual_key_id: key.id,
+        tenant_id: key.tenant_id,
+        provider: provider_snake(chain[0].provider).to_string(),
+        model: chain[0].native_model.clone(),
+        inbound_format: format_name(inbound).to_string(),
+        outbound_format: format_name(outbound).to_string(),
+        started,
+    };
+
     if canonical.stream {
         return stream_request(
             &state,
             outbound,
             chain,
             &canonical,
-            key.id,
             limits,
             rate_headers,
+            log_ctx,
         )
         .await;
     }
@@ -245,11 +250,22 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     input: resp.usage.total_input(),
                     output: resp.usage.output_tokens,
                 };
+                let usage = usage_from(&resp.usage);
                 state
                     .stores
                     .rate_limiter
                     .release(key.id, &limits, Some(actual))
                     .await;
+                // §10.3 step 9: log the answered target + actual usage (no body).
+                let mut rec = log_ctx.new_request_log(200);
+                rec.provider = provider_snake(target.provider).to_string();
+                rec.model = target.native_model.clone();
+                spawn_log(
+                    state.stores.logs.clone(),
+                    state.stores.models.clone(),
+                    rec,
+                    Some(usage),
+                );
                 let mut r = Json(build_response(outbound, &resp)).into_response();
                 apply_rate_headers(r.headers_mut(), &rate_headers);
                 return r;
@@ -264,6 +280,16 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     .rate_limiter
                     .release(key.id, &limits, None)
                     .await;
+                let status = e.status_code() as i16;
+                let mut rec = log_ctx.new_request_log(status);
+                rec.provider = provider_snake(target.provider).to_string();
+                rec.model = target.native_model.clone();
+                spawn_log(
+                    state.stores.logs.clone(),
+                    state.stores.models.clone(),
+                    rec,
+                    None,
+                );
                 return error_response(&e);
             }
         }
@@ -273,6 +299,13 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         .rate_limiter
         .release(key.id, &limits, None)
         .await;
+    let status = last_err.status_code() as i16;
+    spawn_log(
+        state.stores.logs.clone(),
+        state.stores.models.clone(),
+        log_ctx.new_request_log(status),
+        None,
+    );
     error_response(&last_err)
 }
 
@@ -377,6 +410,15 @@ fn provider_snake(p: ProviderId) -> &'static str {
     }
 }
 
+/// Wire string for an inbound/outbound [`Format`] (recorded in request logs).
+fn format_name(f: Format) -> &'static str {
+    match f {
+        Format::OpenaiChat => "openai_chat",
+        Format::Anthropic => "anthropic",
+        Format::Unillm => "unillm",
+    }
+}
+
 /// Clone `canonical` pinned to an explicit `(provider, model)` target for one upstream attempt
 /// (shared by the non-stream walk and the streaming handler).
 fn request_for_target(canonical: &CanonicalRequest, target: &RouteTarget) -> CanonicalRequest {
@@ -398,10 +440,11 @@ async fn stream_request(
     outbound: Format,
     chain: Vec<RouteTarget>,
     canonical: &CanonicalRequest,
-    key_id: Uuid,
     limits: KeyLimits,
     rate_headers: RateHeaders,
+    log_ctx: LogContext,
 ) -> Response {
+    let key_id = log_ctx.virtual_key_id;
     let policy = RetryPolicy::default();
     let mut last_err = CoreError::NotFound {
         message: "no upstream available for this model".into(),
@@ -424,7 +467,17 @@ async fn stream_request(
                     // the client disconnects (the body generator drops → guard drops).
                     let guard =
                         ReleaseGuard::new(state.stores.rate_limiter.clone(), key_id, limits);
-                    return sse_response(outbound, ev, events, guard, rate_headers);
+                    // Log the committed target; the logger captures terminal usage and writes one
+                    // request log at stream completion (§10.3 step 9).
+                    let mut ctx = log_ctx.clone();
+                    ctx.provider = provider_snake(target.provider).to_string();
+                    ctx.model = target.native_model.clone();
+                    let logger = StreamLogger::new(
+                        state.stores.logs.clone(),
+                        state.stores.models.clone(),
+                        ctx,
+                    );
+                    return sse_response(outbound, ev, events, guard, rate_headers, logger);
                 }
                 Some(Err(e)) if policy.should_retry(&e) => {
                     last_err = e;
@@ -476,8 +529,10 @@ fn sse_response(
     mut rest: BoxStream<'static, Result<StreamEvent, CoreError>>,
     guard: ReleaseGuard,
     rate_headers: RateHeaders,
+    mut logger: StreamLogger,
 ) -> Response {
     let mut encoder = encoder_for(outbound);
+    logger.observe(&first);
     let body = Body::from_stream(async_stream::stream! {
         // Hold the concurrency slot until the stream completes or the client disconnects (the
         // generator drops → guard drops → RateLimiter::release).
@@ -490,10 +545,13 @@ fn sse_response(
                 Ok(ev) => ev,
                 Err(e) => StreamEvent::Error { error: e },
             };
+            logger.observe(&ev);
             for line in encoder.encode_event(&ev) {
                 yield Ok::<String, std::io::Error>(line);
             }
         }
+        // §10.3 step 9: write the request log + captured terminal usage (fire-and-forget).
+        logger.finish();
     });
     let mut resp = Response::new(body);
     let headers = resp.headers_mut();
@@ -523,7 +581,7 @@ fn pick_outbound(inbound: Format, override_header: Option<&str>) -> Format {
 }
 
 /// Map a [`CoreError`] onto an HTTP error response (`DESIGN.md` §15.1).
-fn error_response(e: &CoreError) -> Response {
+pub(crate) fn error_response(e: &CoreError) -> Response {
     let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let body = serde_json::json!({ "error": { "kind": e.kind(), "message": e.to_string() } });
     (status, Json(body)).into_response()

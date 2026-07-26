@@ -4,6 +4,8 @@
 //! normalizes to the canonical IR, routes to a backend via [`unillm_core`], and returns any outbound
 //! format. In-memory only (no DB/Redis/keys/RL — M4).
 
+pub mod admin;
+pub mod cli;
 pub mod config;
 pub mod inbound;
 pub mod middleware;
