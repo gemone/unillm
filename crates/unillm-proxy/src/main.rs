@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use unillm_core::{Client as CoreClient, ProviderConfig};
-use unillm_storage::{KeyStore, NewVirtualKey, SqliteStore, hash_secret, key_prefix};
+use unillm_storage::{
+    KeyStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore, hash_secret, key_prefix,
+};
 use uuid::Uuid;
 
 use unillm_proxy::config;
@@ -70,7 +72,18 @@ async fn main() {
         eprintln!("WARNING: no upstream providers configured (set UNILLM_PROV_*_KEY env vars)");
     }
 
-    let state = AppState::new(cfg.routes, clients, store, cfg.key_pepper, cfg.admin_token);
+    let key_store: Arc<dyn KeyStore> = store.clone();
+    let route_store: Arc<dyn RouteStore> = store.clone();
+    let model_store: Arc<dyn ModelStore> = store;
+    let state = AppState::new(
+        clients,
+        key_store,
+        route_store,
+        model_store,
+        cfg.key_pepper,
+        cfg.admin_token,
+        cfg.limits,
+    );
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await

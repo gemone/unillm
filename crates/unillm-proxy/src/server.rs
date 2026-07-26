@@ -1,9 +1,10 @@
 //! axum application: the request handler pipeline (`DESIGN.md` §10.3).
 //!
-//! In-memory only (no DB/Redis/keys/RL — those land in M4). The pipeline: detect inbound format →
-//! parse to canonical → resolve route → walk the (primary, fallbacks) chain, calling the backend
-//! `Client` → translate the response into the client's outbound format. Streaming requests are
-//! re-translated event-by-event (`DESIGN.md` §10.5).
+//! The pipeline: authenticate virtual key → detect inbound format → parse to canonical → enforce
+//! §16 caps → resolve route (DB-backed, M4.3) → validate (allowlist + catalog) → walk the
+//! (primary, fallbacks) chain calling the backend `Client` → translate the response into the
+//! client's outbound format. Streaming requests are re-translated event-by-event (`DESIGN.md`
+//! §10.5). Rate-limiting/concurrency (M4.4) and request/usage logging (M4.5) are not yet wired.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,43 +23,51 @@ use unillm_core::ir::{ModelRef, Request as CanonicalRequest};
 use unillm_core::retry::RetryPolicy;
 use unillm_core::stream::StreamEvent;
 use unillm_core::{Client as CoreClient, CoreError, ProviderId};
-use unillm_storage::KeyStore;
+use unillm_storage::{KeyStore, ModelStore, RouteStore, VirtualKey};
+use uuid::Uuid;
 
+use crate::config::RequestLimits;
 use crate::inbound::{Format, detect_format, parse_request};
 use crate::middleware::auth::{
     authenticate, extract_token, reject_query_key, require_admin, require_scope,
 };
 use crate::outbound::build_response;
 use crate::outbound::stream::encoder_for;
-use crate::route::{RouteTarget, Routes, resolve_chain};
+use crate::route::{RouteTarget, row_to_chain};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// Shared proxy state: the routing table, per-provider backend clients, the key store, and auth
-/// secrets.
+/// Shared proxy state: per-provider backend clients, the storage sub-traits (key/route/model), auth
+/// secrets, and inbound request caps.
 #[derive(Clone)]
 pub struct AppState {
-    pub routes: Arc<Routes>,
     pub clients: Arc<HashMap<ProviderId, Arc<CoreClient>>>,
     pub key_store: Arc<dyn KeyStore>,
+    pub route_store: Arc<dyn RouteStore>,
+    pub model_store: Arc<dyn ModelStore>,
     pub key_pepper: String,
     pub admin_token: Option<String>,
+    pub limits: RequestLimits,
 }
 
 impl AppState {
     pub fn new(
-        routes: Routes,
         clients: HashMap<ProviderId, Arc<CoreClient>>,
         key_store: Arc<dyn KeyStore>,
+        route_store: Arc<dyn RouteStore>,
+        model_store: Arc<dyn ModelStore>,
         key_pepper: String,
         admin_token: Option<String>,
+        limits: RequestLimits,
     ) -> Self {
         Self {
-            routes: Arc::new(routes),
             clients: Arc::new(clients),
             key_store,
+            route_store,
+            model_store,
             key_pepper,
             admin_token,
+            limits,
         }
     }
 }
@@ -155,12 +164,25 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         Ok(r) => r,
         Err(e) => return error_response(&e),
     };
+    // §16: enforce inbound request caps.
+    if let Err(e) = check_caps(&canonical, &state.limits) {
+        return error_response(&e);
+    }
     let outbound = pick_outbound(inbound, response_format_header.as_deref());
 
-    let chain = match resolve_chain(&canonical.model, &state.routes) {
-        Ok(c) => c,
-        Err(e) => return error_response(&e),
-    };
+    // Resolve the route (DB for aliases, M4.3) scoped to the key's tenant.
+    let chain =
+        match resolve_model(&*state.route_store, &canonical.model, Some(key.tenant_id)).await {
+            Ok(c) => c,
+            Err(e) => return error_response(&e),
+        };
+    // §10.3 step 3 (validate): key model allowlist + catalog enabled-check.
+    if let Err(e) = check_allowlist(&key, &crate::route::model_id(&canonical.model)) {
+        return error_response(&e);
+    }
+    if let Err(e) = check_catalog_enabled(&*state.model_store, &chain[0]).await {
+        return error_response(&e);
+    }
     if canonical.stream {
         return stream_request(&state, outbound, chain, &canonical).await;
     }
@@ -193,6 +215,107 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         }
     }
     error_response(&last_err)
+}
+
+/// §16 inbound caps (`DESIGN.md` §16): input items, tools, output tokens.
+fn check_caps(req: &CanonicalRequest, limits: &RequestLimits) -> Result<(), CoreError> {
+    if req.input.len() > limits.max_input_items {
+        return Err(CoreError::InvalidRequest {
+            message: format!(
+                "too many input items ({}, limit {})",
+                req.input.len(),
+                limits.max_input_items
+            ),
+        });
+    }
+    if let Some(tools) = &req.tools
+        && tools.len() > limits.max_tools
+    {
+        return Err(CoreError::InvalidRequest {
+            message: format!(
+                "too many tools ({}, limit {})",
+                tools.len(),
+                limits.max_tools
+            ),
+        });
+    }
+    if let Some(mt) = req.max_tokens
+        && mt > limits.max_output_tokens
+    {
+        return Err(CoreError::InvalidRequest {
+            message: format!("max_tokens {mt} exceeds cap {}", limits.max_output_tokens),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve a [`ModelRef`] into an ordered target chain (`DESIGN.md` §10.2). An explicit
+/// `(provider, model)` pair is a single-target chain; an alias is looked up in the route store
+/// (tenant-scoped, falling back to the global default).
+async fn resolve_model(
+    store: &dyn RouteStore,
+    model: &ModelRef,
+    tenant: Option<Uuid>,
+) -> Result<Vec<RouteTarget>, CoreError> {
+    match model {
+        ModelRef::Explicit { provider, model } => Ok(vec![RouteTarget {
+            provider: *provider,
+            native_model: model.clone(),
+        }]),
+        ModelRef::Alias(alias) => {
+            let row = store
+                .resolve(alias, tenant)
+                .await
+                .map_err(|e| CoreError::Other {
+                    message: format!("route lookup failed: {e}"),
+                })?
+                .ok_or_else(|| CoreError::NotFound {
+                    message: format!("no route for model alias '{alias}'"),
+                })?;
+            row_to_chain(&row)
+        }
+    }
+}
+
+/// The key's `model_allowlist` (if set) must contain the requested model id (`DESIGN.md` §10.3 step 3).
+fn check_allowlist(key: &VirtualKey, requested: &str) -> Result<(), CoreError> {
+    if let Some(allowed) = &key.model_allowlist
+        && !allowed.iter().any(|m| m == requested)
+    {
+        return Err(CoreError::InvalidRequest {
+            message: format!("model '{requested}' is not in this key's allowlist"),
+        });
+    }
+    Ok(())
+}
+
+/// Best-effort catalog check (`DESIGN.md` §13.2): if the primary model is registered and disabled,
+/// reject. Models absent from the catalog are allowed (the catalog is optional metadata).
+async fn check_catalog_enabled(
+    store: &dyn ModelStore,
+    target: &RouteTarget,
+) -> Result<(), CoreError> {
+    if let Ok(Some(m)) = store
+        .get_model(provider_snake(target.provider), &target.native_model)
+        .await
+    {
+        if !m.enabled {
+            return Err(CoreError::InvalidRequest {
+                message: format!("model '{}' is disabled", target.native_model),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The snake_case string form of a [`ProviderId`] (matches its serde serialization).
+fn provider_snake(p: ProviderId) -> &'static str {
+    match p {
+        ProviderId::Openai => "openai",
+        ProviderId::Anthropic => "anthropic",
+        ProviderId::Openrouter => "openrouter",
+        ProviderId::Deepseek => "deepseek",
+    }
 }
 
 /// Clone `canonical` pinned to an explicit `(provider, model)` target for one upstream attempt

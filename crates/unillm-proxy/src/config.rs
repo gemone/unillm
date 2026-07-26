@@ -6,8 +6,6 @@ use std::net::SocketAddr;
 
 use unillm_core::ProviderId;
 
-use crate::route::Routes;
-
 /// An upstream provider's credentials and address.
 #[derive(Debug, Clone)]
 pub struct Upstream {
@@ -15,11 +13,38 @@ pub struct Upstream {
     pub base_url: String,
 }
 
+/// Proxy-level request caps (`DESIGN.md` §16: max input items, tools, output tokens).
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLimits {
+    pub max_input_items: usize,
+    pub max_tools: usize,
+    pub max_output_tokens: u32,
+}
+
+impl RequestLimits {
+    /// Development defaults; overridable via `UNILLM_MAX_*` env vars.
+    fn from_env() -> Self {
+        Self {
+            max_input_items: env::var("UNILLM_MAX_INPUT_ITEMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+            max_tools: env::var("UNILLM_MAX_TOOLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(128),
+            max_output_tokens: env::var("UNILLM_MAX_OUTPUT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16_384),
+        }
+    }
+}
+
 /// Proxy configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
-    pub routes: Routes,
     pub upstreams: HashMap<ProviderId, Upstream>,
     /// sqlx URL (`sqlite:...` now, `postgres://...` in M4.5). `DESIGN.md` §14.1.
     pub database_url: String,
@@ -29,6 +54,8 @@ pub struct Config {
     pub key_pepper: String,
     /// If set, a dev key with this secret is seeded at startup (broad scopes, no limits).
     pub seed_key: Option<String>,
+    /// Inbound request caps (`DESIGN.md` §16).
+    pub limits: RequestLimits,
 }
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
@@ -46,8 +73,7 @@ fn provider_env(provider: ProviderId) -> (&'static str, &'static str) {
 /// Load configuration from the environment (`DESIGN.md` §14.1).
 ///
 /// Upstreams are enabled per provider by setting `UNILLM_PROV_<PROVIDER>_KEY` (with an optional
-/// `..._BASE_URL` override). Routes are configured programmatically for now (the DB-backed routes
-/// table arrives in M4).
+/// `..._BASE_URL` override). Routes live in the DB `routes` table (M4.3).
 pub fn from_env() -> Config {
     let bind = env::var("UNILLM_PROXY_BIND")
         .unwrap_or_else(|_| DEFAULT_BIND.into())
@@ -85,11 +111,11 @@ pub fn from_env() -> Config {
 
     Config {
         bind,
-        routes: Routes::new(),
         upstreams,
         database_url,
         admin_token,
         key_pepper,
         seed_key,
+        limits: RequestLimits::from_env(),
     }
 }

@@ -13,5 +13,5 @@ pub mod server;
 
 pub use inbound::{Format, detect_format, parse_request};
 pub use outbound::build_response;
-pub use route::{Route, RouteTarget, Routes, resolve_chain};
+pub use route::{RouteTarget, row_to_chain};
 pub use server::{AppState, build_app};
