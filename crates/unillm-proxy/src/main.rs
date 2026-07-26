@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use unillm_core::{Client as CoreClient, ProviderConfig};
 use unillm_storage::{
-    KeyStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore, hash_secret, key_prefix,
+    InMemoryRateLimiter, KeyStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore, hash_secret,
+    key_prefix,
 };
 use uuid::Uuid;
 
 use unillm_proxy::config;
-use unillm_proxy::server::{AppState, build_app};
+use unillm_proxy::server::{AppState, Stores, build_app};
 
 /// Scopes granted to an env-seeded dev key (`DESIGN.md` §13.1).
 const SEED_SCOPES: &[&str] = &["data", "admin", "read-usage"];
@@ -72,18 +73,16 @@ async fn main() {
         eprintln!("WARNING: no upstream providers configured (set UNILLM_PROV_*_KEY env vars)");
     }
 
-    let key_store: Arc<dyn KeyStore> = store.clone();
-    let route_store: Arc<dyn RouteStore> = store.clone();
-    let model_store: Arc<dyn ModelStore> = store;
-    let state = AppState::new(
-        clients,
-        key_store,
-        route_store,
-        model_store,
-        cfg.key_pepper,
-        cfg.admin_token,
-        cfg.limits,
-    );
+    let keys: Arc<dyn KeyStore> = store.clone();
+    let routes: Arc<dyn RouteStore> = store.clone();
+    let models: Arc<dyn ModelStore> = store;
+    let stores = Stores {
+        keys,
+        routes,
+        models,
+        rate_limiter: Arc::new(InMemoryRateLimiter::new()),
+    };
+    let state = AppState::new(clients, stores, cfg.key_pepper, cfg.admin_token, cfg.limits);
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await

@@ -1,10 +1,11 @@
 //! axum application: the request handler pipeline (`DESIGN.md` §10.3).
 //!
 //! The pipeline: authenticate virtual key → detect inbound format → parse to canonical → enforce
-//! §16 caps → resolve route (DB-backed, M4.3) → validate (allowlist + catalog) → walk the
-//! (primary, fallbacks) chain calling the backend `Client` → translate the response into the
-//! client's outbound format. Streaming requests are re-translated event-by-event (`DESIGN.md`
-//! §10.5). Rate-limiting/concurrency (M4.4) and request/usage logging (M4.5) are not yet wired.
+//! §16 caps → rate-limit/acquire (§12, M4.4) → resolve route (DB-backed, M4.3) → validate
+//! (allowlist + catalog) → walk the (primary, fallbacks) chain calling the backend `Client` →
+//! translate the response into the client's outbound format. Streaming requests are re-translated
+//! event-by-event (`DESIGN.md` §10.5); the rate-limit concurrency slot releases when the stream
+//! ends or the client drops. Request/usage logging (M4.5) is not yet wired.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +24,10 @@ use unillm_core::ir::{ModelRef, Request as CanonicalRequest};
 use unillm_core::retry::RetryPolicy;
 use unillm_core::stream::StreamEvent;
 use unillm_core::{Client as CoreClient, CoreError, ProviderId};
-use unillm_storage::{KeyStore, ModelStore, RouteStore, VirtualKey};
+use unillm_storage::{
+    KeyLimits, KeyStore, ModelStore, RateDecision, RateHeaders, RateLimiter, RouteStore,
+    TokenActual, VirtualKey,
+};
 use uuid::Uuid;
 
 use crate::config::RequestLimits;
@@ -31,20 +35,30 @@ use crate::inbound::{Format, detect_format, parse_request};
 use crate::middleware::auth::{
     authenticate, extract_token, reject_query_key, require_admin, require_scope,
 };
+use crate::middleware::rate_limit::{
+    ReleaseGuard, apply_rate_headers, estimate_tokens, rate_limited_response,
+};
 use crate::outbound::build_response;
 use crate::outbound::stream::encoder_for;
 use crate::route::{RouteTarget, row_to_chain};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// Shared proxy state: per-provider backend clients, the storage sub-traits (key/route/model), auth
-/// secrets, and inbound request caps.
+/// The storage + limits layer: the four pluggable trait-object backends held by [`AppState`].
+#[derive(Clone)]
+pub struct Stores {
+    pub keys: Arc<dyn KeyStore>,
+    pub routes: Arc<dyn RouteStore>,
+    pub models: Arc<dyn ModelStore>,
+    pub rate_limiter: Arc<dyn RateLimiter>,
+}
+
+/// Shared proxy state: per-provider backend clients, the storage+limits layer, auth secrets, and
+/// inbound request caps.
 #[derive(Clone)]
 pub struct AppState {
     pub clients: Arc<HashMap<ProviderId, Arc<CoreClient>>>,
-    pub key_store: Arc<dyn KeyStore>,
-    pub route_store: Arc<dyn RouteStore>,
-    pub model_store: Arc<dyn ModelStore>,
+    pub stores: Stores,
     pub key_pepper: String,
     pub admin_token: Option<String>,
     pub limits: RequestLimits,
@@ -53,18 +67,14 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         clients: HashMap<ProviderId, Arc<CoreClient>>,
-        key_store: Arc<dyn KeyStore>,
-        route_store: Arc<dyn RouteStore>,
-        model_store: Arc<dyn ModelStore>,
+        stores: Stores,
         key_pepper: String,
         admin_token: Option<String>,
         limits: RequestLimits,
     ) -> Self {
         Self {
             clients: Arc::new(clients),
-            key_store,
-            route_store,
-            model_store,
+            stores,
             key_pepper,
             admin_token,
             limits,
@@ -134,7 +144,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     };
 
     // Data plane (§10.3 step 1): authenticate the virtual key, then require the `data` scope.
-    let key = match authenticate(&*state.key_store, token.as_deref(), &state.key_pepper).await {
+    let key = match authenticate(&*state.stores.keys, token.as_deref(), &state.key_pepper).await {
         Ok(k) => k,
         Err(e) => return error_response(&e),
     };
@@ -150,6 +160,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             });
         }
     };
+    let body_len = body_bytes.len();
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -170,9 +181,26 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     }
     let outbound = pick_outbound(inbound, response_format_header.as_deref());
 
+    // Rate limit (§12): acquire under the key's limits before doing any upstream work.
+    let limits = KeyLimits::from_key(&key);
+    let estimate = estimate_tokens(body_len, canonical.max_tokens);
+    let rate_headers = match state
+        .stores
+        .rate_limiter
+        .acquire(key.id, &limits, estimate)
+        .await
+    {
+        RateDecision::Allow(h) => h,
+        RateDecision::Deny {
+            retry_after,
+            headers,
+            ..
+        } => return rate_limited_response(retry_after, headers),
+    };
+
     // Resolve the route (DB for aliases, M4.3) scoped to the key's tenant.
     let chain =
-        match resolve_model(&*state.route_store, &canonical.model, Some(key.tenant_id)).await {
+        match resolve_model(&*state.stores.routes, &canonical.model, Some(key.tenant_id)).await {
             Ok(c) => c,
             Err(e) => return error_response(&e),
         };
@@ -180,11 +208,20 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     if let Err(e) = check_allowlist(&key, &crate::route::model_id(&canonical.model)) {
         return error_response(&e);
     }
-    if let Err(e) = check_catalog_enabled(&*state.model_store, &chain[0]).await {
+    if let Err(e) = check_catalog_enabled(&*state.stores.models, &chain[0]).await {
         return error_response(&e);
     }
     if canonical.stream {
-        return stream_request(&state, outbound, chain, &canonical).await;
+        return stream_request(
+            &state,
+            outbound,
+            chain,
+            &canonical,
+            key.id,
+            limits,
+            rate_headers,
+        )
+        .await;
     }
 
     let policy = RetryPolicy::default();
@@ -204,16 +241,38 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         let try_req = request_for_target(&canonical, target);
         match client.create(&try_req).await {
             Ok(resp) => {
-                let body = build_response(outbound, &resp);
-                return Json(body).into_response();
+                let actual = TokenActual {
+                    input: resp.usage.total_input(),
+                    output: resp.usage.output_tokens,
+                };
+                state
+                    .stores
+                    .rate_limiter
+                    .release(key.id, &limits, Some(actual))
+                    .await;
+                let mut r = Json(build_response(outbound, &resp)).into_response();
+                apply_rate_headers(r.headers_mut(), &rate_headers);
+                return r;
             }
             Err(e) if policy.should_retry(&e) => {
                 last_err = e;
                 continue;
             }
-            Err(e) => return error_response(&e),
+            Err(e) => {
+                state
+                    .stores
+                    .rate_limiter
+                    .release(key.id, &limits, None)
+                    .await;
+                return error_response(&e);
+            }
         }
     }
+    state
+        .stores
+        .rate_limiter
+        .release(key.id, &limits, None)
+        .await;
     error_response(&last_err)
 }
 
@@ -339,6 +398,9 @@ async fn stream_request(
     outbound: Format,
     chain: Vec<RouteTarget>,
     canonical: &CanonicalRequest,
+    key_id: Uuid,
+    limits: KeyLimits,
+    rate_headers: RateHeaders,
 ) -> Response {
     let policy = RetryPolicy::default();
     let mut last_err = CoreError::NotFound {
@@ -357,12 +419,25 @@ async fn stream_request(
         let try_req = request_for_target(canonical, target);
         match client.stream(&try_req).await {
             Ok(mut events) => match events.next().await {
-                Some(Ok(ev)) => return sse_response(outbound, ev, events),
+                Some(Ok(ev)) => {
+                    // Commit: the guard releases the concurrency slot when the stream completes or
+                    // the client disconnects (the body generator drops → guard drops).
+                    let guard =
+                        ReleaseGuard::new(state.stores.rate_limiter.clone(), key_id, limits);
+                    return sse_response(outbound, ev, events, guard, rate_headers);
+                }
                 Some(Err(e)) if policy.should_retry(&e) => {
                     last_err = e;
                     continue;
                 }
-                Some(Err(e)) => return error_response(&e),
+                Some(Err(e)) => {
+                    state
+                        .stores
+                        .rate_limiter
+                        .release(key_id, &limits, None)
+                        .await;
+                    return error_response(&e);
+                }
                 None => {
                     last_err = CoreError::Stream {
                         message: "upstream stream closed without emitting any events".into(),
@@ -374,9 +449,21 @@ async fn stream_request(
                 last_err = e;
                 continue;
             }
-            Err(e) => return error_response(&e),
+            Err(e) => {
+                state
+                    .stores
+                    .rate_limiter
+                    .release(key_id, &limits, None)
+                    .await;
+                return error_response(&e);
+            }
         }
     }
+    state
+        .stores
+        .rate_limiter
+        .release(key_id, &limits, None)
+        .await;
     error_response(&last_err)
 }
 
@@ -387,9 +474,14 @@ fn sse_response(
     outbound: Format,
     first: StreamEvent,
     mut rest: BoxStream<'static, Result<StreamEvent, CoreError>>,
+    guard: ReleaseGuard,
+    rate_headers: RateHeaders,
 ) -> Response {
     let mut encoder = encoder_for(outbound);
     let body = Body::from_stream(async_stream::stream! {
+        // Hold the concurrency slot until the stream completes or the client disconnects (the
+        // generator drops → guard drops → RateLimiter::release).
+        let _guard = guard;
         for line in encoder.encode_event(&first) {
             yield Ok::<String, std::io::Error>(line);
         }
@@ -417,6 +509,7 @@ fn sse_response(
         axum::http::header::CONNECTION,
         HeaderValue::from_static("keep-alive"),
     );
+    apply_rate_headers(headers, &rate_headers);
     resp
 }
 

@@ -8,6 +8,7 @@ pub mod error;
 pub mod keys;
 pub mod migrate;
 pub mod model;
+pub mod rate_limit;
 pub mod sqlite;
 pub mod store;
 
@@ -15,6 +16,10 @@ pub use error::StoreError;
 pub use keys::{generate_secret, hash_secret, key_prefix};
 pub use model::{
     FallbackTarget, ModelRow, NewModel, NewRoute, NewVirtualKey, RouteRow, VirtualKey,
+};
+pub use rate_limit::{
+    DenyReason, InMemoryRateLimiter, KeyLimits, RateDecision, RateHeaders, RateLimiter,
+    TokenActual, TokenEstimate,
 };
 pub use sqlite::SqliteStore;
 pub use store::{KeyStore, ModelStore, RouteStore};

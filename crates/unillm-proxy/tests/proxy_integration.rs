@@ -12,10 +12,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use unillm_core::retry::RetryPolicy;
 use unillm_core::{Client as CoreClient, ProviderConfig, ProviderId};
 use unillm_proxy::config::RequestLimits;
-use unillm_proxy::server::{AppState, build_app};
+use unillm_proxy::server::{AppState, Stores, build_app};
 use unillm_storage::model::FallbackTarget;
 use unillm_storage::{
-    KeyStore, ModelStore, NewModel, NewRoute, NewVirtualKey, RouteStore, SqliteStore,
+    InMemoryRateLimiter, KeyStore, ModelStore, NewModel, NewRoute, NewVirtualKey, RouteStore,
+    SqliteStore,
 };
 
 const PEPPER: &str = "test-pepper";
@@ -86,6 +87,32 @@ async fn seed_route(
         .unwrap();
 }
 
+/// Seed a `data`-scoped key with rate/concurrency/budget limits set.
+async fn seed_key_rl(
+    store: &Arc<SqliteStore>,
+    rpm: Option<i32>,
+    conc: Option<i32>,
+    budget: Option<i64>,
+) -> String {
+    let secret = unillm_storage::generate_secret();
+    store
+        .create_key(NewVirtualKey {
+            key_hash: unillm_storage::hash_secret(&secret, PEPPER),
+            key_prefix: unillm_storage::key_prefix(&secret),
+            tenant_id: Uuid::new_v4(),
+            scopes: vec!["data".into()],
+            model_allowlist: None,
+            budget_daily_tokens: budget,
+            rpm,
+            tpm: None,
+            max_concurrency: conc,
+            expires_at: None,
+        })
+        .await
+        .unwrap();
+    secret
+}
+
 /// Start the proxy on an ephemeral port; return its base URL.
 async fn start_proxy(
     clients: HashMap<ProviderId, Arc<CoreClient>>,
@@ -93,14 +120,18 @@ async fn start_proxy(
     admin_token: Option<String>,
     limits: RequestLimits,
 ) -> String {
-    let key_store: Arc<dyn KeyStore> = store.clone();
-    let route_store: Arc<dyn RouteStore> = store.clone();
-    let model_store: Arc<dyn ModelStore> = store;
+    let keys: Arc<dyn KeyStore> = store.clone();
+    let routes: Arc<dyn RouteStore> = store.clone();
+    let models: Arc<dyn ModelStore> = store;
+    let stores = Stores {
+        keys,
+        routes,
+        models,
+        rate_limiter: Arc::new(InMemoryRateLimiter::new()),
+    };
     let app = build_app(AppState::new(
         clients,
-        key_store,
-        route_store,
-        model_store,
+        stores,
         PEPPER.into(),
         admin_token,
         limits,
@@ -920,4 +951,173 @@ async fn stream_routes_every_cc_dialect_provider() {
             "{provider:?}: missing [DONE]"
         );
     }
+}
+
+// --- rate limiting & concurrency (M4.4) ------------------------------------------
+
+#[tokio::test]
+async fn rpm_third_request_is_429_with_retry_after() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    let secret = seed_key_rl(&store, Some(2), None, None).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store, None, default_limits()).await;
+
+    let req = || {
+        http()
+            .post(format!("{url}/v1/chat/completions"))
+            .header("authorization", format!("Bearer {secret}"))
+            .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+    };
+    assert_eq!(req().send().await.unwrap().status(), 200);
+    assert_eq!(req().send().await.unwrap().status(), 200);
+    let third = req().send().await.unwrap();
+    assert_eq!(third.status(), 429);
+    assert!(third.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn concurrency_one_blocks_second_parallel() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(300))
+                .set_body_json(json!({
+                    "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                })),
+        )
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    let secret = seed_key_rl(&store, None, Some(1), None).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store, None, default_limits()).await;
+
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let hdr = format!("Bearer {secret}");
+    // Two simultaneous in-flight requests against a concurrency-1 key: one wins (200), one is
+    // denied (429). The 300ms upstream delay keeps the winner's slot held while the loser acquires.
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send();
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send();
+    let (r1, r2) = tokio::join!(r1, r2);
+    let codes = [r1.unwrap().status().as_u16(), r2.unwrap().status().as_u16()];
+    assert!(codes.contains(&429), "expected one 429, got {codes:?}");
+    assert!(codes.contains(&200), "expected one 200, got {codes:?}");
+}
+
+#[tokio::test]
+async fn budget_exhausts_then_429() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 80, "completion_tokens": 10}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    // budget=100; one request reconciles 90 actual tokens, exhausting it for the next.
+    let secret = seed_key_rl(&store, None, None, Some(100)).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store, None, default_limits()).await;
+
+    // max_tokens=4 keeps the pre-call estimate (~prompt + 4) under the budget so the first is admitted.
+    let body = json!({"model": "gpt-4o", "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]});
+    let hdr = format!("Bearer {secret}");
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 429);
+}
+
+#[tokio::test]
+async fn stream_slot_released_after_completion() {
+    let upstream = MockServer::start().await;
+    mount_sse(&upstream, "/chat/completions", CC_SSE).await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+
+    let store = mem_store().await;
+    let secret = seed_key_rl(&store, None, Some(1), None).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store, None, default_limits()).await;
+
+    let body =
+        json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let hdr = format!("Bearer {secret}");
+    // First stream: drain the body so the ReleaseGuard drops and the concurrency slot releases.
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let _ = r1.text().await.unwrap();
+    // Second stream: the slot was freed, so this is admitted (200), not 429.
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
 }
