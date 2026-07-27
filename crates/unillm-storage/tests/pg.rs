@@ -135,6 +135,7 @@ async fn pg_full_round_trip() {
                 inbound_format: "openai_chat".into(),
                 outbound_format: "openai_chat".into(),
                 status: 200,
+                cached: false,
                 latency_ms: Some(5),
             },
             Some(NewUsage {

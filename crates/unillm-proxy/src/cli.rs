@@ -62,6 +62,15 @@ pub enum AdminCmd {
         #[arg(long, default_value_t = 50)]
         limit: i64,
     },
+    /// Flush the response cache (`DESIGN.md` §7.4, §10.6).
+    Cache {
+        /// Flush only this scope (virtual key id); omit for all scopes.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Flush only this cache key hash; omit for all hashes.
+        #[arg(long)]
+        key_hash: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -215,6 +224,24 @@ pub async fn run_admin_at(
             }
             print_response(req.send().await?).await?;
         }
+        AdminCmd::Cache { scope, key_hash } => {
+            let mut body = json!({});
+            if let Some(v) = scope {
+                body["scope"] = v.into();
+            }
+            if let Some(v) = key_hash {
+                body["key_hash"] = v.into();
+            }
+            print_response(
+                client
+                    .post(format!("{base}/admin/cache/invalidate"))
+                    .header("authorization", &auth)
+                    .json(&body)
+                    .send()
+                    .await?,
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -302,11 +329,13 @@ async fn print_response(r: reqwest::Response) -> Result<(), Box<dyn std::error::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
+    use crate::middleware::cache::CacheConfig;
     use crate::server::{AppState, Stores, build_app};
     use std::collections::HashMap;
     use std::sync::Arc;
     use unillm_storage::{
-        InMemoryRateLimiter, KeyStore, LogStore, ModelStore, RouteStore, SqliteStore,
+        InMemoryCache, InMemoryRateLimiter, KeyStore, LogStore, ModelStore, RouteStore, SqliteStore,
     };
     use uuid::Uuid;
 
@@ -322,6 +351,7 @@ mod tests {
             models,
             logs,
             rate_limiter: Arc::new(InMemoryRateLimiter::new()),
+            cache: Arc::new(InMemoryCache::new()),
         };
         let app = build_app(AppState::new(
             HashMap::new(),
@@ -333,6 +363,8 @@ mod tests {
                 max_tools: 128,
                 max_output_tokens: 16_384,
             },
+            CacheConfig::disabled(),
+            Arc::new(Metrics::new()),
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -495,7 +495,7 @@ impl LogStore for SqliteStore {
             "INSERT INTO request_logs
                (id, request_id, virtual_key_id, tenant_id, provider, model,
                 inbound_format, outbound_format, status, cached, latency_ms, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(&log.request_id)
@@ -506,6 +506,7 @@ impl LogStore for SqliteStore {
         .bind(&log.inbound_format)
         .bind(&log.outbound_format)
         .bind(log.status)
+        .bind(log.cached)
         .bind(log.latency_ms)
         .bind(now)
         .execute(&self.pool)
@@ -642,6 +643,7 @@ mod tests {
             inbound_format: "openai_chat".into(),
             outbound_format: "openai_chat".into(),
             status,
+            cached: false,
             latency_ms: Some(42),
         }
     }

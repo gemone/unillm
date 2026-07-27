@@ -166,6 +166,8 @@ pub struct NewRequestLog {
     pub inbound_format: String,
     pub outbound_format: String,
     pub status: i16,
+    /// `true` when the response was served from the exact-hash cache (M5) rather than the upstream.
+    pub cached: bool,
     pub latency_ms: Option<i32>,
 }
 

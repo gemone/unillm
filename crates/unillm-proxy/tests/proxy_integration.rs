@@ -12,11 +12,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use unillm_core::retry::RetryPolicy;
 use unillm_core::{Client as CoreClient, ProviderConfig, ProviderId};
 use unillm_proxy::config::RequestLimits;
+use unillm_proxy::metrics::Metrics;
+use unillm_proxy::middleware::cache::CacheConfig;
 use unillm_proxy::server::{AppState, Stores, build_app};
 use unillm_storage::model::FallbackTarget;
 use unillm_storage::{
-    InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewModel, NewRoute, NewVirtualKey,
-    RequestLog, RouteStore, SqliteStore,
+    InMemoryCache, InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewModel, NewRoute,
+    NewVirtualKey, RequestLog, RouteStore, SqliteStore,
 };
 
 const PEPPER: &str = "test-pepper";
@@ -113,12 +115,23 @@ async fn seed_key_rl(
     secret
 }
 
-/// Start the proxy on an ephemeral port; return its base URL.
+/// Start the proxy on an ephemeral port; return its base URL. The response cache is disabled.
 async fn start_proxy(
     clients: HashMap<ProviderId, Arc<CoreClient>>,
     store: Arc<SqliteStore>,
     admin_token: Option<String>,
     limits: RequestLimits,
+) -> String {
+    start_proxy_with_cache(clients, store, admin_token, limits, CacheConfig::disabled()).await
+}
+
+/// Start the proxy with an explicit response-cache config (for the cache-hit tests).
+async fn start_proxy_with_cache(
+    clients: HashMap<ProviderId, Arc<CoreClient>>,
+    store: Arc<SqliteStore>,
+    admin_token: Option<String>,
+    limits: RequestLimits,
+    cache_cfg: CacheConfig,
 ) -> String {
     let keys: Arc<dyn KeyStore> = store.clone();
     let routes: Arc<dyn RouteStore> = store.clone();
@@ -130,6 +143,7 @@ async fn start_proxy(
         models,
         logs,
         rate_limiter: Arc::new(InMemoryRateLimiter::new()),
+        cache: Arc::new(InMemoryCache::new()),
     };
     let app = build_app(AppState::new(
         clients,
@@ -137,6 +151,8 @@ async fn start_proxy(
         PEPPER.into(),
         admin_token,
         limits,
+        cache_cfg,
+        Arc::new(Metrics::new()),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1108,6 +1124,42 @@ async fn stream_slot_released_after_completion() {
 
 // --- M4.5 logging -------------------------------------------------------------
 
+/// Regression (M5 review): an early-return error path after rate-limit acquire must release the
+/// concurrency slot. With concurrency=1, a leaked slot would lock the key out after one error —
+/// the second request here would be 429 instead of 404.
+#[tokio::test]
+async fn concurrency_slot_released_on_error_path() {
+    let store = mem_store().await;
+    let secret = seed_key_rl(&store, None, Some(1), None).await; // concurrency = 1
+    // No route seeded → "nope" is an unknown alias → 404 after acquiring the slot.
+    let url = start_proxy(HashMap::new(), store, None, default_limits()).await;
+    let hdr = format!("Bearer {secret}");
+    let body = json!({"model": "nope", "messages": []});
+
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 404);
+
+    // If the 404 leaked the slot, this acquire sees in_flight=1 → 429. After the fix it's 404 again.
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.status(),
+        404,
+        "concurrency slot leaked on the error path"
+    );
+}
+
 /// Poll until at least one request log exists (the write is fire-and-forget).
 async fn await_log(store: &SqliteStore) -> Vec<RequestLog> {
     for _ in 0..100 {
@@ -1512,4 +1564,348 @@ async fn admin_routes_crud() {
         .unwrap();
     let list: Vec<Value> = r.json().await.unwrap();
     assert!(list.is_empty());
+}
+
+// --- M5.1 response cache -------------------------------------------------------
+
+/// Mount a deterministic CC completion mock that allows at most `n` upstream calls.
+async fn mount_cc_completion(server: &MockServer, n: u64) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "cached!"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        })))
+        .expect(n)
+        .mount(server)
+        .await;
+}
+
+/// Poll until at least one request log with `cached = true` exists.
+async fn await_cached_log(store: &SqliteStore) {
+    for _ in 0..100 {
+        let logs = store.list_logs(None, None, 20).await.unwrap();
+        if logs.iter().any(|l| l.cached) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no cached request log written within ~1s");
+}
+
+#[tokio::test]
+async fn cache_hit_short_circuits_with_header() {
+    let upstream = MockServer::start().await;
+    mount_cc_completion(&upstream, 1).await; // only the miss may reach upstream
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store.clone(),
+        None,
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let hdr = format!("Bearer {secret}");
+
+    // First call: miss, populates the cache.
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    assert_eq!(r1.headers().get("x-unillm-cache").unwrap(), "MISS");
+
+    // Second identical call: hit, no upstream contact, same body.
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    assert_eq!(r2.headers().get("x-unillm-cache").unwrap(), "HIT");
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(b2["choices"][0]["message"]["content"], "cached!");
+
+    await_cached_log(&store).await; // the hit is logged with cached = true
+}
+
+#[tokio::test]
+async fn cache_key_is_scoped_to_virtual_key() {
+    let upstream = MockServer::start().await;
+    mount_cc_completion(&upstream, 2).await; // key A miss + key B miss; key A's 2nd is a hit
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret_a = seed_key(&store, &["data"]).await;
+    let secret_b = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store,
+        None,
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+
+    // Key A: miss.
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret_a}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("x-unillm-cache").unwrap(), "MISS");
+
+    // Key B: same body, different key → NOT a hit (scope isolation, no cross-key leakage).
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret_b}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("x-unillm-cache").unwrap(), "MISS");
+
+    // Key A again: now a hit.
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret_a}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("x-unillm-cache").unwrap(), "HIT");
+}
+
+#[tokio::test]
+async fn cache_invalidate_flushes_entries() {
+    let upstream = MockServer::start().await;
+    // miss, then a second miss after invalidation (the hit between them does not call upstream).
+    mount_cc_completion(&upstream, 2).await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store,
+        Some(ADMIN.into()),
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let hdr = format!("Bearer {secret}");
+
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.headers().get("x-unillm-cache").unwrap(), "MISS");
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.headers().get("x-unillm-cache").unwrap(), "HIT");
+
+    // Flush the cache via the admin endpoint.
+    let r = http()
+        .post(format!("{url}/admin/cache/invalidate"))
+        .header("authorization", admin_hdr())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let inv: Value = r.json().await.unwrap();
+    assert!(inv["invalidated"].as_u64().unwrap() >= 1);
+
+    // Next request is a miss again.
+    let r3 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r3.headers().get("x-unillm-cache").unwrap(), "MISS");
+}
+
+#[tokio::test]
+async fn stream_bypasses_cache() {
+    let upstream = MockServer::start().await;
+    mount_sse(&upstream, "/chat/completions", CC_SSE).await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store,
+        None,
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model": "gpt-4o", "stream": true, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // Streams never touch the cache → no X-Unillm-Cache header.
+    assert!(r.headers().get("x-unillm-cache").is_none());
+    let _ = r.text().await.unwrap();
+}
+
+// --- M5.2 metrics --------------------------------------------------------------
+
+#[tokio::test]
+async fn metrics_endpoint_counts_requests() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy(clients, store, None, default_limits()).await;
+
+    // Before any request, /metrics is already valid Prometheus exposition.
+    let m0 = http().get(format!("{url}/metrics")).send().await.unwrap();
+    assert_eq!(m0.status(), 200);
+    assert!(
+        m0.text()
+            .await
+            .unwrap()
+            .contains("# TYPE unillm_requests_total counter")
+    );
+
+    // Make one data-plane request (cache disabled → cache outcome "none").
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+
+    // /metrics now reflects the request, its tokens, and a latency observation.
+    let body = http()
+        .get(format!("{url}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(
+        "unillm_requests_total{provider=\"openai\",model=\"gpt-4o\",status=\"200\",cache=\"none\"} 1"
+    ));
+    assert!(
+        body.contains(
+            "unillm_tokens_total{provider=\"openai\",model=\"gpt-4o\",kind=\"input\"} 10"
+        )
+    );
+    assert!(
+        body.contains(
+            "unillm_request_duration_seconds_count{provider=\"openai\",model=\"gpt-4o\"} 1"
+        )
+    );
+}
+
+// --- M5.3 OpenAPI --------------------------------------------------------------
+
+#[tokio::test]
+async fn openapi_and_docs_are_served() {
+    let url = start_proxy(HashMap::new(), mem_store().await, None, default_limits()).await;
+
+    let r = http()
+        .get(format!("{url}/openapi.json"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let spec: Value = r.json().await.unwrap();
+    assert_eq!(spec["openapi"], "3.0.3");
+    assert!(
+        spec["paths"]
+            .as_object()
+            .unwrap()
+            .contains_key("/admin/keys")
+    );
+
+    let r = http().get(format!("{url}/docs")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("data-url=\"/openapi.json\"")
+    );
 }

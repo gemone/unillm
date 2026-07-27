@@ -1,0 +1,79 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (fmt, clippy, test, pg)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: unillm
+          POSTGRES_PASSWORD: unillm
+          POSTGRES_DB: unillm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U unillm" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy (postgres feature)
+        run: cargo clippy -p unillm-storage --features postgres --all-targets -- -D warnings
+      - name: test (workspace, sqlite)
+        run: cargo test --workspace
+      - name: test (postgres cross-DB gate)
+        env:
+          UNILLM_PG_TEST_URL: postgres://unillm:unillm@localhost:5432/unillm
+        run: cargo test -p unillm-storage --features postgres --test pg
+
+  python:
+    name: python (maturin, pytest, mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install maturin / anyio deps
+        run: pip install -U maturin anyio pytest mypy
+      - name: build + install wheel
+        run: maturin develop --release
+      - name: pytest
+        run: pytest tests/python -q
+      - name: mypy --strict
+        run: mypy --strict python/unillm
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit
+        run: cargo audit --deny warnings

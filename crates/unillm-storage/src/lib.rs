@@ -1,10 +1,12 @@
 //! unillm-storage: pluggable storage backends for the proxy (`DESIGN.md` §11).
 //!
 //! The proxy depends only on the storage sub-traits ([`KeyStore`], [`ModelStore`], [`RouteStore`],
-//! [`LogStore`]); each has a swappable backend. This crate ships the SQLite backend
+//! [`LogStore`], [`CacheStore`]); each has a swappable backend. This crate ships the SQLite backend
 //! ([`SqliteStore`]) and the migration runner; the PostgreSQL backend ([`PostgresStore`]) is
-//! available with the `postgres` feature.
+//! available with the `postgres` feature. The exact-hash response cache ([`InMemoryCache`]) is
+//! in-process now; Redis/DB are the production primaries behind the same [`CacheStore`] trait.
 
+pub mod cache;
 pub mod error;
 pub mod keys;
 pub mod migrate;
@@ -15,6 +17,7 @@ pub mod rate_limit;
 pub mod sqlite;
 pub mod store;
 
+pub use cache::{CacheStore, InMemoryCache};
 pub use error::StoreError;
 pub use keys::{generate_secret, hash_secret, key_prefix};
 pub use model::{

@@ -17,6 +17,17 @@ pub enum Format {
     Unillm,
 }
 
+impl Format {
+    /// The storage/log wire string for this format (`openai_chat` / `anthropic` / `unillm`).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Format::OpenaiChat => "openai_chat",
+            Format::Anthropic => "anthropic",
+            Format::Unillm => "unillm",
+        }
+    }
+}
+
 /// Detect the inbound format (`DESIGN.md` §10.1): path prefix → `X-Unillm-Format` header → body shape.
 pub fn detect_format(path: &str, header: Option<&str>, body: &Value) -> Format {
     if path.contains("/chat/completions") {

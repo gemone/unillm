@@ -27,14 +27,18 @@ use unillm_core::retry::RetryPolicy;
 use unillm_core::stream::StreamEvent;
 use unillm_core::{Client as CoreClient, CoreError, ProviderId};
 use unillm_storage::{
-    KeyLimits, KeyStore, LogStore, ModelStore, RateDecision, RateHeaders, RateLimiter, RouteStore,
-    TokenActual, VirtualKey,
+    CacheStore, KeyLimits, KeyStore, LogStore, ModelStore, RateDecision, RateHeaders, RateLimiter,
+    RouteStore, TokenActual, VirtualKey,
 };
 use uuid::Uuid;
 
 use crate::config::RequestLimits;
 use crate::inbound::{Format, detect_format, parse_request};
+use crate::metrics::{CacheOutcome, Metrics};
 use crate::middleware::auth::{authenticate, extract_token, reject_query_key, require_scope};
+use crate::middleware::cache::{
+    CacheConfig, cache_key, cacheable, decode_response, encode_response,
+};
 use crate::middleware::log::{LogContext, StreamLogger, spawn_log, usage_from};
 use crate::middleware::rate_limit::{
     ReleaseGuard, apply_rate_headers, estimate_tokens, rate_limited_response,
@@ -53,6 +57,8 @@ pub struct Stores {
     pub models: Arc<dyn ModelStore>,
     pub logs: Arc<dyn LogStore>,
     pub rate_limiter: Arc<dyn RateLimiter>,
+    /// Exact-hash response cache (`DESIGN.md` §7.4). In-memory now; Redis/DB behind the same trait.
+    pub cache: Arc<dyn CacheStore>,
 }
 
 /// Shared proxy state: per-provider backend clients, the storage+limits layer, auth secrets, and
@@ -64,6 +70,8 @@ pub struct AppState {
     pub key_pepper: String,
     pub admin_token: Option<String>,
     pub limits: RequestLimits,
+    pub cache_cfg: CacheConfig,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -73,6 +81,8 @@ impl AppState {
         key_pepper: String,
         admin_token: Option<String>,
         limits: RequestLimits,
+        cache_cfg: CacheConfig,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             clients: Arc::new(clients),
@@ -80,6 +90,8 @@ impl AppState {
             key_pepper,
             admin_token,
             limits,
+            cache_cfg,
+            metrics,
         }
     }
 }
@@ -93,11 +105,41 @@ pub fn build_app(state: AppState) -> Router {
         .merge(crate::admin::router(state.clone()))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(docs))
         .with_state(state)
 }
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
+
+/// OpenAPI document (`DESIGN.md` §10.6, §17). Public (no secrets).
+async fn openapi_json() -> impl IntoResponse {
+    Json(crate::openapi::openapi_spec())
+}
+
+/// Interactive Scalar docs (`DESIGN.md` §17). Renders `/openapi.json`.
+async fn docs() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
+        crate::openapi::docs_html(),
+    )
+}
+
+/// Prometheus metrics (`DESIGN.md` §17 `/metrics`).
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        state.metrics.render(),
+    )
 }
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
@@ -188,6 +230,59 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
         } => return rate_limited_response(retry_after, headers),
     };
 
+    // The concurrency slot acquired above is released by this guard on every exit (early validation
+    // errors, cache hit, success, all-failed) — `complete` for the usage-aware success path,
+    // `disarm` for the stream handoff, and `Drop` for everything else. No manual `release` per path.
+    let mut slot = ReleaseGuard::new(state.stores.rate_limiter.clone(), key.id, limits);
+
+    // Cache lookup (`DESIGN.md` §10.3 step 5): when the response cache is on and this is a
+    // cacheable (non-stream) request, a hit short-circuits the whole upstream walk. The key is
+    // scoped to the virtual key (§7.4) — no cross-key leakage. A hit re-checks the key's model
+    // allowlist (free, synchronous) in case an admin narrowed it during the TTL.
+    if cacheable(state.cache_cfg, &canonical) {
+        let scope = key.id.to_string();
+        let kh = cache_key(&canonical, &scope);
+        if let Some(bytes) = state.stores.cache.get(&scope, &kh).await
+            && let Some(cached) = decode_response(&bytes)
+        {
+            if let Err(e) = check_allowlist(&key, &crate::route::model_id(&canonical.model)) {
+                return error_response(&e);
+            }
+            // No upstream call; the slot is released by `slot`'s `Drop` on return.
+            // Log the hit: status 200, cached=true, no usage (tokens were spent on the miss).
+            let mut rec = LogContext::for_request(
+                key.id,
+                key.tenant_id,
+                provider_snake(cached.provider),
+                cached.model.clone(),
+                inbound,
+                outbound,
+                started,
+            )
+            .new_request_log(200);
+            rec.cached = true;
+            spawn_log(
+                state.stores.logs.clone(),
+                state.stores.models.clone(),
+                rec,
+                None,
+            );
+            state.metrics.record(
+                provider_snake(cached.provider),
+                &cached.model,
+                200,
+                CacheOutcome::Hit,
+                started.elapsed(),
+                None,
+            );
+            let mut r = Json(build_response(outbound, &cached)).into_response();
+            r.headers_mut()
+                .insert("x-unillm-cache", HeaderValue::from_static("HIT"));
+            apply_rate_headers(r.headers_mut(), &rate_headers);
+            return r;
+        }
+    }
+
     // Resolve the route (DB for aliases, M4.3) scoped to the key's tenant.
     let chain =
         match resolve_model(&*state.stores.routes, &canonical.model, Some(key.tenant_id)).await {
@@ -205,18 +300,20 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // Request/usage logging context (§10.3 step 9): metadata only, no bodies. The provider/model
     // default to the resolved primary; the non-stream walk overrides them with the target that
     // actually answered. `virtual_key_id` carries `key.id` for the rate-limit/stream paths.
-    let log_ctx = LogContext {
-        request_id: Uuid::new_v4().to_string(),
-        virtual_key_id: key.id,
-        tenant_id: key.tenant_id,
-        provider: provider_snake(chain[0].provider).to_string(),
-        model: chain[0].native_model.clone(),
-        inbound_format: format_name(inbound).to_string(),
-        outbound_format: format_name(outbound).to_string(),
+    let log_ctx = LogContext::for_request(
+        key.id,
+        key.tenant_id,
+        provider_snake(chain[0].provider),
+        chain[0].native_model.clone(),
+        inbound,
+        outbound,
         started,
-    };
+    );
 
     if canonical.stream {
+        // The streaming path moves its own body-scoped `ReleaseGuard` in to release the slot when
+        // the stream ends; disarm this one so the slot is not double-released.
+        slot.disarm();
         return stream_request(
             &state,
             outbound,
@@ -251,11 +348,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     output: resp.usage.output_tokens,
                 };
                 let usage = usage_from(&resp.usage);
-                state
-                    .stores
-                    .rate_limiter
-                    .release(key.id, &limits, Some(actual))
-                    .await;
+                slot.complete(Some(actual)).await;
                 // §10.3 step 9: log the answered target + actual usage (no body).
                 let mut rec = log_ctx.new_request_log(200);
                 rec.provider = provider_snake(target.provider).to_string();
@@ -266,7 +359,30 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     rec,
                     Some(usage),
                 );
+                state.metrics.record(
+                    provider_snake(target.provider),
+                    &target.native_model,
+                    200,
+                    if cacheable(state.cache_cfg, &canonical) {
+                        CacheOutcome::Miss
+                    } else {
+                        CacheOutcome::None
+                    },
+                    started.elapsed(),
+                    Some(&usage),
+                );
                 let mut r = Json(build_response(outbound, &resp)).into_response();
+                if cacheable(state.cache_cfg, &canonical) {
+                    let scope = key.id.to_string();
+                    let kh = cache_key(&canonical, &scope);
+                    state
+                        .stores
+                        .cache
+                        .put(&scope, &kh, encode_response(&resp), state.cache_cfg.ttl)
+                        .await;
+                    r.headers_mut()
+                        .insert("x-unillm-cache", HeaderValue::from_static("MISS"));
+                }
                 apply_rate_headers(r.headers_mut(), &rate_headers);
                 return r;
             }
@@ -275,11 +391,6 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                 continue;
             }
             Err(e) => {
-                state
-                    .stores
-                    .rate_limiter
-                    .release(key.id, &limits, None)
-                    .await;
                 let status = e.status_code() as i16;
                 let mut rec = log_ctx.new_request_log(status);
                 rec.provider = provider_snake(target.provider).to_string();
@@ -290,16 +401,27 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
                     rec,
                     None,
                 );
+                state.metrics.record(
+                    provider_snake(target.provider),
+                    &target.native_model,
+                    status,
+                    CacheOutcome::None,
+                    started.elapsed(),
+                    None,
+                );
                 return error_response(&e);
             }
         }
     }
-    state
-        .stores
-        .rate_limiter
-        .release(key.id, &limits, None)
-        .await;
     let status = last_err.status_code() as i16;
+    state.metrics.record(
+        provider_snake(chain[0].provider),
+        &chain[0].native_model,
+        status,
+        CacheOutcome::None,
+        started.elapsed(),
+        None,
+    );
     spawn_log(
         state.stores.logs.clone(),
         state.stores.models.clone(),
@@ -410,15 +532,6 @@ fn provider_snake(p: ProviderId) -> &'static str {
     }
 }
 
-/// Wire string for an inbound/outbound [`Format`] (recorded in request logs).
-fn format_name(f: Format) -> &'static str {
-    match f {
-        Format::OpenaiChat => "openai_chat",
-        Format::Anthropic => "anthropic",
-        Format::Unillm => "unillm",
-    }
-}
-
 /// Clone `canonical` pinned to an explicit `(provider, model)` target for one upstream attempt
 /// (shared by the non-stream walk and the streaming handler).
 fn request_for_target(canonical: &CanonicalRequest, target: &RouteTarget) -> CanonicalRequest {
@@ -475,6 +588,7 @@ async fn stream_request(
                     let logger = StreamLogger::new(
                         state.stores.logs.clone(),
                         state.stores.models.clone(),
+                        state.metrics.clone(),
                         ctx,
                     );
                     return sse_response(outbound, ev, events, guard, rate_headers, logger);

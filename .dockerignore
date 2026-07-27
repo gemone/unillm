@@ -1,0 +1,23 @@
+# Keep the Docker build context small.
+target/
+**/target/
+crates/unillm-python/target/
+crates/unillm-python/Cargo.lock
+
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.so
+*.pyd
+*.dylib
+*.db
+.env*
+.omc/
+.claude/
+node_modules/

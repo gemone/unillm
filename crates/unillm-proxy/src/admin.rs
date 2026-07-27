@@ -44,6 +44,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/admin/routes/{alias}", delete(delete_route))
         .route("/admin/usage", get(usage))
         .route("/admin/logs", get(logs))
+        .route("/admin/cache/invalidate", post(invalidate_cache))
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
 
@@ -328,4 +329,28 @@ async fn logs(State(state): State<AppState>, Query(q): Query<LogsQuery>) -> Resp
         Ok(logs) => ok_json(logs),
         Err(e) => err_store(e),
     }
+}
+
+// --- cache (§7.4 invalidation, §10.6) -------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct InvalidateRequest {
+    /// Flush only this scope (virtual key id); `None` = all scopes.
+    scope: Option<String>,
+    /// Flush only this cache key hash; `None` = all hashes.
+    key_hash: Option<String>,
+}
+
+/// Flush cached responses (`DESIGN.md` §7.4 invalidation, §10.6). Both fields `None` flushes
+/// everything; together they flush one entry. Returns the count removed.
+async fn invalidate_cache(
+    State(state): State<AppState>,
+    Json(req): Json<InvalidateRequest>,
+) -> Response {
+    let invalidated = state
+        .stores
+        .cache
+        .invalidate(req.scope.as_deref(), req.key_hash.as_deref())
+        .await;
+    ok_json(json!({ "invalidated": invalidated }))
 }

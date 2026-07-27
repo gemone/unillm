@@ -448,7 +448,7 @@ impl LogStore for PostgresStore {
             "INSERT INTO request_logs
                (id, request_id, virtual_key_id, tenant_id, provider, model,
                 inbound_format, outbound_format, status, cached, latency_ms, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(id)
         .bind(&log.request_id)
@@ -459,6 +459,7 @@ impl LogStore for PostgresStore {
         .bind(&log.inbound_format)
         .bind(&log.outbound_format)
         .bind(log.status)
+        .bind(log.cached)
         .bind(log.latency_ms)
         .bind(now)
         .execute(&self.pool)

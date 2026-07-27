@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "unillm"
-version = "0.1.0"
+version = "1.0.0"
 description = "Unified LLM framework — talk to OpenAI, Anthropic, OpenRouter, and DeepSeek through one API."
 readme = "README.md"
 requires-python = ">=3.9"

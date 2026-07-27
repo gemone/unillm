@@ -56,6 +56,8 @@ pub struct Config {
     pub seed_key: Option<String>,
     /// Inbound request caps (`DESIGN.md` §16).
     pub limits: RequestLimits,
+    /// Exact-hash response cache (`DESIGN.md` §7.4, §14.1). Opt-in; off by default.
+    pub cache: crate::middleware::cache::CacheConfig,
 }
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
@@ -117,5 +119,6 @@ pub fn from_env() -> Config {
         key_pepper,
         seed_key,
         limits: RequestLimits::from_env(),
+        cache: crate::middleware::cache::CacheConfig::from_env(),
     }
 }

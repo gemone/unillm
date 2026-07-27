@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use unillm_core::{Client as CoreClient, ProviderConfig};
 use unillm_storage::{
-    InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewVirtualKey, RouteStore, SqliteStore,
-    hash_secret, key_prefix,
+    InMemoryCache, InMemoryRateLimiter, KeyStore, LogStore, ModelStore, NewVirtualKey, RouteStore,
+    SqliteStore, hash_secret, key_prefix,
 };
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ use clap::Parser;
 
 use unillm_proxy::cli::{Cli, TopCmd};
 use unillm_proxy::config;
+use unillm_proxy::metrics::Metrics;
 use unillm_proxy::server::{AppState, Stores, build_app};
 
 /// Scopes granted to an env-seeded dev key (`DESIGN.md` §13.1).
@@ -100,8 +101,17 @@ async fn serve() {
         models,
         logs,
         rate_limiter: Arc::new(InMemoryRateLimiter::new()),
+        cache: Arc::new(InMemoryCache::new()),
     };
-    let state = AppState::new(clients, stores, cfg.key_pepper, cfg.admin_token, cfg.limits);
+    let state = AppState::new(
+        clients,
+        stores,
+        cfg.key_pepper,
+        cfg.admin_token,
+        cfg.limits,
+        cfg.cache,
+        Arc::new(Metrics::new()),
+    );
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await

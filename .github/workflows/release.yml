@@ -1,0 +1,77 @@
+name: release
+
+# Publish the Python SDK wheels to PyPI, build + push the proxy container image to
+# ghcr.io, and cut a GitHub release on every `v*` tag (`DESIGN.md` §20, §21).
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  python-wheels:
+    name: build & publish wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -U maturin
+      - name: build wheels (matrix)
+        run: maturin build --release --interpreter python${{ matrix.python }}
+      - name: upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.python }}
+          path: target/wheels/*.whl
+      - name: publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: maturin publish --no-sdist --interpreter python${{ matrix.python }} || true
+
+  docker:
+    name: build & push proxy image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/unillm-proxy:latest
+            ghcr.io/${{ github.repository_owner }}/unillm-proxy:${{ github.ref_name }}
+
+  github-release:
+    name: GitHub release
+    needs: [python-wheels, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

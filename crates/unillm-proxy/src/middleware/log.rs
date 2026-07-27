@@ -14,6 +14,9 @@ use uuid::Uuid;
 use unillm_core::Usage;
 use unillm_storage::{LogStore, ModelStore, NewRequestLog, NewUsage};
 
+use crate::inbound::Format;
+use crate::metrics::{CacheOutcome, Metrics};
+
 /// What the data plane knows about a request once it has authenticated, rate-limited, and resolved
 /// a route — enough to write a request log without ever touching the body. `started` carries the
 /// request's start instant for latency.
@@ -30,7 +33,34 @@ pub struct LogContext {
 }
 
 impl LogContext {
-    /// Build the storage record for this request at `status`, with measured latency.
+    /// Build a context for a request once it has authenticated and knows its `(provider, model)`:
+    /// a fresh request id, the key/tenant, the inbound/outbound wire names, and the start instant.
+    /// Used by both the upstream path (provider/model from the resolved route) and the cache-hit
+    /// path (from the cached response) so the field set lives in one place.
+    pub fn for_request(
+        virtual_key_id: Uuid,
+        tenant_id: Uuid,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        inbound: Format,
+        outbound: Format,
+        started: Instant,
+    ) -> Self {
+        Self {
+            request_id: Uuid::new_v4().to_string(),
+            virtual_key_id,
+            tenant_id,
+            provider: provider.into(),
+            model: model.into(),
+            inbound_format: inbound.wire_name().to_string(),
+            outbound_format: outbound.wire_name().to_string(),
+            started,
+        }
+    }
+
+    /// Build the storage record for this request at `status`, with measured latency. `cached` is
+    /// `false` — cache hits build their record separately (the provider/model come from the cached
+    /// response, not the resolved route).
     pub fn new_request_log(&self, status: i16) -> NewRequestLog {
         NewRequestLog {
             request_id: self.request_id.clone(),
@@ -41,6 +71,7 @@ impl LogContext {
             inbound_format: self.inbound_format.clone(),
             outbound_format: self.outbound_format.clone(),
             status,
+            cached: false,
             latency_ms: Some(latency(self.started)),
         }
     }
@@ -103,19 +134,27 @@ pub fn spawn_log(
 
 /// Streaming log collector: observes events as they flow to capture the terminal usage, then writes
 /// one request log (status 200, since the stream committed) when the stream completes. A dropped
-/// stream (client disconnect) is not logged — best-effort, like the rate-limit slot release.
+/// stream (client disconnect) is not logged — best-effort, like the rate-limit slot release. The
+/// metrics registry is also updated at completion so stream token totals reach Prometheus.
 pub struct StreamLogger {
     logs: Arc<dyn LogStore>,
     models: Arc<dyn ModelStore>,
+    metrics: Arc<Metrics>,
     ctx: LogContext,
     usage: Option<NewUsage>,
 }
 
 impl StreamLogger {
-    pub fn new(logs: Arc<dyn LogStore>, models: Arc<dyn ModelStore>, ctx: LogContext) -> Self {
+    pub fn new(
+        logs: Arc<dyn LogStore>,
+        models: Arc<dyn ModelStore>,
+        metrics: Arc<Metrics>,
+        ctx: LogContext,
+    ) -> Self {
         Self {
             logs,
             models,
+            metrics,
             ctx,
             usage: None,
         }
@@ -128,8 +167,17 @@ impl StreamLogger {
         }
     }
 
-    /// Fire-and-forget the accumulated log (called at stream completion).
+    /// Fire-and-forget the accumulated log + metrics (called at stream completion).
     pub fn finish(self) {
+        let latency = self.ctx.started.elapsed();
+        self.metrics.record(
+            &self.ctx.provider,
+            &self.ctx.model,
+            200,
+            CacheOutcome::None,
+            latency,
+            self.usage.as_ref(),
+        );
         spawn_log(
             self.logs,
             self.models,

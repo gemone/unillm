@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use uuid::Uuid;
 
-use unillm_storage::{KeyLimits, RateHeaders, RateLimiter, TokenEstimate};
+use unillm_storage::{KeyLimits, RateHeaders, RateLimiter, TokenActual, TokenEstimate};
 
 /// A crude pre-call token estimate (`DESIGN.md` §12.1): ~4 bytes/token for the prompt, plus the
 /// requested `max_tokens` (or a default). Only used when the key has token-based limits.
@@ -51,13 +51,20 @@ pub fn rate_limited_response(retry_after: Duration, headers: RateHeaders) -> Res
     resp
 }
 
-/// A guard that releases the held concurrency slot when dropped. It is moved into a streaming
-/// response body so the slot frees when the stream completes OR the client disconnects (mirrors the
-/// M3.4 cancellation path). `release` is async, so `Drop` spawns it on the runtime.
+/// A guard that releases the held concurrency slot when dropped. It serves two roles:
+///   * moved into a streaming response body, it frees the slot when the stream completes OR the
+///     client disconnects (mirrors the M3.4 cancellation path);
+///   * held in the non-stream handler scope, it guarantees the slot is released on **every** exit
+///     (early validation errors, all-failed, success) without a manual `release` at each return.
+///
+/// `release` is async, so `Drop` spawns it on the runtime. Use [`ReleaseGuard::complete`] to release
+/// with known usage (success) or [`ReleaseGuard::disarm`] when handing the slot off (the stream path
+/// owns its own body-scoped guard).
 pub struct ReleaseGuard {
     limiter: Arc<dyn RateLimiter>,
     key_id: Uuid,
     limits: KeyLimits,
+    armed: bool,
 }
 
 impl ReleaseGuard {
@@ -66,12 +73,33 @@ impl ReleaseGuard {
             limiter,
             key_id,
             limits,
+            armed: true,
         }
+    }
+
+    /// Release the slot with actual usage and disarm so `Drop` does not release again. Idempotent.
+    /// Use on the successful non-stream path where token usage is known.
+    pub async fn complete(&mut self, actual: Option<TokenActual>) {
+        if self.armed {
+            self.limiter
+                .release(self.key_id, &self.limits, actual)
+                .await;
+            self.armed = false;
+        }
+    }
+
+    /// Disarm without releasing — for the streaming path, which moves its own body-scoped guard in
+    /// to release when the stream ends (so the slot is neither double-released nor leaked).
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let limiter = self.limiter.clone();
         let key_id = self.key_id;
         let limits = self.limits;
