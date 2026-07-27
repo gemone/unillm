@@ -98,7 +98,7 @@ pub fn from_env() -> Config {
     }
 
     let database_url =
-        env::var("UNILLM_DATABASE_URL").unwrap_or_else(|_| "sqlite:unillm.db".into());
+        env::var("UNILLM_DATABASE_URL").unwrap_or_else(|_| "sqlite://./unillm.db".into());
     let admin_token = env::var("UNILLM_ADMIN_TOKEN").ok();
     let key_pepper = match env::var("UNILLM_KEY_PEPPER") {
         Ok(p) => p,

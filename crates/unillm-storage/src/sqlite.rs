@@ -6,7 +6,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::error::StoreError;
@@ -25,10 +26,15 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Open a pool at `url` (e.g. `sqlite::memory:` or `sqlite://./unillm.db`) and apply migrations.
+    ///
+    /// sqlx 0.9 defaults to `create_if_missing(false)`, so a missing file errors with
+    /// `SQLITE_CANTOPEN` (code 14). The SQLite dev backend is expected to create the file, so we
+    /// force it on here; `sqlite::memory:` is unaffected. Callers therefore don't need `?mode=rwc`.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(opts)
             .await?;
         Self::from_pool(pool).await
     }

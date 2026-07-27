@@ -30,7 +30,7 @@ else
     echo "# UNILLM_PROV_OPENROUTER_KEY="
     echo "# UNILLM_PROV_DEEPSEEK_KEY="
     echo
-    echo "UNILLM_DATABASE_URL=sqlite:unillm.db"
+    echo "UNILLM_DATABASE_URL=sqlite://./unillm.db"
     echo "# UNILLM_CACHE_ENABLED=true"
     echo "# UNILLM_CACHE_TTL=300"
   } > "$ENV_FILE"
