@@ -209,7 +209,7 @@ fn build_messages(req: &Request) -> Vec<Value> {
                     .push(json!({ "role": "tool", "tool_call_id": call_id, "content": output }));
             }
             Item::Reasoning { .. } => {
-                // No CC equivalent; dropped (DESIGN.md §5.5).
+                // Read-only on the request side; not re-echoed to the provider (`DESIGN.md` §5.2/§5.5).
             }
         }
     }

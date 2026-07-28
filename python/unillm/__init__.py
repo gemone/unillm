@@ -7,15 +7,9 @@ in exactly one place.
 
 from __future__ import annotations
 
-import json
 import os
-from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from ._native import Client as _NativeClient
-from ._native import EventStream as _NativeEventStream
-from ._native import UnillmError as _NativeUnillmError
-from ._native import __version__
 from .exceptions import (
     AuthenticationError,
     InvalidRequestError,
@@ -27,6 +21,15 @@ from .exceptions import (
     UnillmError,
     from_native,
 )
+
+if TYPE_CHECKING:
+    # The native extension is referenced only in annotations — imported lazily at runtime (see
+    # `Client.__init__` / `EventStream.__anext__`) so `import unillm` does not load the Rust core.
+    from types import ModuleType
+
+    from ._native import Client as _NativeClient
+    from ._native import EventStream as _NativeEventStream
+    from ._native import UnillmError as _NativeUnillmError
 
 __all__ = [
     # client + types
@@ -54,6 +57,45 @@ __all__ = [
     "from_env",
     "__version__",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    # `__version__` lives in the native extension; resolve it lazily so `import unillm` (or touching
+    # `unillm.UnillmError`) does not load the Rust core. Cached into globals after first access.
+    if name == "__version__":
+        from ._native import __version__ as _v
+
+        globals()["__version__"] = _v
+        return _v
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+_native_unillm_error_cls: type[BaseException] | None = None
+_json_module: ModuleType | None = None
+
+
+def _native_unillm_error() -> type[BaseException]:
+    """The native ``UnillmError`` class, imported lazily and cached. `import unillm` must not pull in
+    the Rust core, so the native exception type is resolved only when an error actually flows."""
+    global _native_unillm_error_cls
+    if _native_unillm_error_cls is not None:
+        return _native_unillm_error_cls
+    from ._native import UnillmError as _cls
+
+    _native_unillm_error_cls = _cls
+    return _native_unillm_error_cls
+
+
+def _json() -> ModuleType:
+    """The stdlib `json` module, imported lazily and cached so `import unillm` does not pull it in
+    (json + json.decoder + re are a large share of cold-start cost)."""
+    global _json_module
+    if _json_module is not None:
+        return _json_module
+    import json as _j
+
+    _json_module = _j
+    return _json_module
 
 
 def _build_input(
@@ -105,27 +147,51 @@ def _build_request(
 # --- typed wrappers -----------------------------------------------------------
 
 
-@dataclass
 class Usage:
-    input_tokens: int
-    output_tokens: int
-    cache_read: int
-    cache_creation: int
-    cost_usd: float | None = None
+    """Token + cost accounting. A plain class (not `@dataclass`) so `import unillm` need not pull
+    in `dataclasses`/`inspect` — cold-start stays minimal (`DESIGN.md` §9.3)."""
+
+    __slots__ = ("input_tokens", "output_tokens", "cache_read", "cache_creation", "cost_usd")
+
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_creation: int,
+        cost_usd: float | None = None,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read = cache_read
+        self.cache_creation = cache_creation
+        self.cost_usd = cost_usd
 
     @property
     def total_input(self) -> int:
         return self.input_tokens + self.cache_read + self.cache_creation
 
 
-@dataclass
 class Response:
-    id: str
-    model: str
-    provider: str
-    output: list[Mapping[str, Any]]
-    stop_reason: str
-    usage: Usage
+    """A canonical response. Plain class (not `@dataclass`) for minimal cold-start."""
+
+    __slots__ = ("id", "model", "provider", "output", "stop_reason", "usage")
+
+    def __init__(
+        self,
+        id: str,
+        model: str,
+        provider: str,
+        output: list[Mapping[str, Any]],
+        stop_reason: str,
+        usage: Usage,
+    ) -> None:
+        self.id = id
+        self.model = model
+        self.provider = provider
+        self.output = output
+        self.stop_reason = stop_reason
+        self.usage = usage
 
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "Response":
@@ -147,6 +213,8 @@ class Response:
 
     @classmethod
     def from_json(cls, raw: str) -> "Response":
+        import json
+
         return cls.from_dict(json.loads(raw))
 
     @property
@@ -181,9 +249,9 @@ class EventStream:
     async def __anext__(self) -> dict[str, Any]:
         try:
             raw = await self._native.__anext__()  # StopAsyncIteration propagates at end of stream
-        except _NativeUnillmError as e:
+        except _native_unillm_error() as e:
             raise from_native(e) from None
-        event: dict[str, Any] = json.loads(raw)
+        event: dict[str, Any] = _json().loads(raw)
         return event
 
     async def collect(self) -> Response:
@@ -208,6 +276,9 @@ class Client:
         base_url: str | None = None,
         timeout: float | None = None,
     ) -> None:
+        # Lazy: loading the Rust core is deferred to first Client construction.
+        from ._native import Client as _NativeClient
+
         self._native = _NativeClient(provider, api_key, base_url=base_url, timeout=timeout)
 
     @classmethod
@@ -253,8 +324,8 @@ class Client:
             metadata=metadata,
         )
         try:
-            raw = await self._native.create(json.dumps(request))
-        except _NativeUnillmError as e:
+            raw = await self._native.create(_json().dumps(request))
+        except _native_unillm_error() as e:
             raise from_native(e) from None
         return Response.from_json(raw)
 
@@ -286,7 +357,7 @@ class Client:
             cache=cache,
             metadata=metadata,
         )
-        return EventStream(self._native.stream(json.dumps(request)))
+        return EventStream(self._native.stream(_json().dumps(request)))
 
 
 # --- item / content helpers (DESIGN.md §9.1) ---------------------------------

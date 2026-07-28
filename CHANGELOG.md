@@ -21,6 +21,11 @@ standalone translator proxy covering **OpenAI, Anthropic, OpenRouter, and DeepSe
 - **Provider adapters** — Chat Completions (OpenAI/DeepSeek/OpenRouter) and Anthropic Messages,
   with usage normalization (`input_tokens + cache_read + cache_creation == provider prompt
   tokens`) and an SSE codec + per-dialect stream decoders (`DESIGN.md` §5, §6).
+- **Reasoning pass-through** — a backend's `reasoning_content` (DeepSeek reasoner / v4-flash) maps
+  to the canonical `Reasoning` item and is surfaced on egress as CC `reasoning_content`, Anthropic
+  `thinking`, or the canonical item — both non-streaming and streaming (`StreamEvent::ReasoningDelta`,
+  with the CC decoder opening the reasoning item lazily ahead of the answer). Reverses the §5.5
+  "drop reasoning" degradation (`DESIGN.md` §5.4, §5.5).
 - **Python SDK (`unillm`)** — PyO3 + anyio `Client`/`Response`/`EventStream` with a bounded
   tokio-channel async iterator bridge; cancellation drops the upstream connection
   (`DESIGN.md` §9, §6.6).
@@ -53,6 +58,13 @@ standalone translator proxy covering **OpenAI, Anthropic, OpenRouter, and DeepSe
   `ci.yml` (fmt, clippy `-D warnings`, workspace + postgres tests, pytest, mypy `--strict`,
   `cargo audit`) and `release.yml` (PyPI wheels via maturin, ghcr image, GitHub release on
   `v*` tags).
+
+### Fixed
+
+- **SQLite `create_if_missing`** — sqlx 0.9 defaults `create_if_missing(false)`, so the proxy
+  failed to boot with `SQLITE_CANTOPEN` (code 14) on the default `sqlite://./unillm.db` url
+  (in-memory tests were unaffected). `SqliteStore::connect` now forces `create_if_missing(true)`;
+  default url aligned to `sqlite://./unillm.db` (`DESIGN.md` §14.1).
 
 ### Deferred (tracked, post-v1)
 

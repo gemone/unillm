@@ -83,7 +83,7 @@ logging/usage, rate-limiting, and response caching.
 
 ### Principles
 - **Canonical is king:** all normalization happens against §4; providers never leak their native shape into the public API.
-- **Fail loudly, never silently degrade** undocumented behavior — where degradation is unavoidable (e.g. dropping reasoning for a CC client), it is documented (§5.4) and tested.
+- **Fail loudly, never silently degrade** undocumented behavior — where degradation is unavoidable (e.g. not re-echoing read-only reasoning content back to a provider, §5.5), it is documented and tested.
 - **Shared core, thin edges:** SDK and proxy import the same `unillm-core`; no duplicated normalization.
 - **Streaming is a first-class object,** not a callback.
 
@@ -468,7 +468,7 @@ Each dialect = 3 pure transforms + 1 HTTP layer:
 | image block (base64) | `{type:"image_url", image_url:{url:"data:<media>;base64,<data>"}}` |
 | `function_call` | an `{role:"assistant", tool_calls:[{id,type:"function",function:{name,arguments}}]}` message |
 | `function_call_output` | `{role:"tool", tool_call_id, content}` |
-| `reasoning` | dropped (logged) — no CC equivalent; DeepSeek reasoner echo is read-only |
+| `reasoning` | dropped — read-only; not re-echoed to the provider (§5.5) |
 | `max_tokens` | `max_tokens` |
 | `temperature`/`top_p`/`stop` | same names (`stop`) |
 | `tools` | `[{type:"function", function:{name,description,parameters:input_schema}}]` |
@@ -502,6 +502,7 @@ Each dialect = 3 pure transforms + 1 HTTP layer:
 | Native field | Canonical |
 |---|---|
 | CC `choices[0].message.content` | `Item::message(assistant, Text)` |
+| CC `choices[0].message.reasoning_content` (DeepSeek reasoner / v4-flash) | `Item::reasoning{summary}` (before the answer message) |
 | CC `choices[0].message.tool_calls[]` | `Item::function_call` each |
 | CC `finish_reason` | `StopReason` (`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`, `content_filter`→`other`) |
 | CC `usage.prompt_tokens` minus `cached_tokens` | `Usage.input_tokens`; `cached_tokens`→`cache_read` |
@@ -513,7 +514,10 @@ Each dialect = 3 pure transforms + 1 HTTP layer:
 | OpenRouter `usage.cost` | `Usage.cost_usd` |
 
 ### 5.5 Documented degradations (must be tested)
-- **reasoning → CC client:** reasoning items are dropped when emitting CC (no equivalent). Logged at debug.
+- **reasoning:** surfaced — a backend's `reasoning_content` (DeepSeek reasoner / v4-flash) maps to
+  `Item::reasoning` and is emitted on egress as CC `reasoning_content`, Anthropic `thinking`, or the
+  canonical item (non-stream and stream `reasoning_delta`). The one exception is echoing reasoning
+  *back* in a request: it is read-only and dropped from `build_payload` (§5.2, §5.3).
 - **`previous_response_id` / Responses server state:** only honored by the Responses dialect; with
   CC/Anthropic the canonical client must pass full history in `input`. `store=false` when stateless.
 - **`top_k`:** Anthropic-only; exposed via adapter opt-in, not in the base `Request` for v1.
