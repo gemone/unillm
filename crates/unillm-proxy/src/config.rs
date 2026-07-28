@@ -62,13 +62,14 @@ pub struct Config {
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 
-/// `(key env var, default base URL)` per provider.
-fn provider_env(provider: ProviderId) -> (&'static str, &'static str) {
+/// The upstream-key env var for a provider. The default base URL comes from the core
+/// (`unillm_core::default_base_url`) so the endpoints live in exactly one place.
+fn provider_env(provider: ProviderId) -> &'static str {
     match provider {
-        ProviderId::Openai => ("UNILLM_PROV_OPENAI_KEY", "https://api.openai.com/v1"),
-        ProviderId::Anthropic => ("UNILLM_PROV_ANTHROPIC_KEY", "https://api.anthropic.com/v1"),
-        ProviderId::Openrouter => ("UNILLM_PROV_OPENROUTER_KEY", "https://openrouter.ai/api/v1"),
-        ProviderId::Deepseek => ("UNILLM_PROV_DEEPSEEK_KEY", "https://api.deepseek.com"),
+        ProviderId::Openai => "UNILLM_PROV_OPENAI_KEY",
+        ProviderId::Anthropic => "UNILLM_PROV_ANTHROPIC_KEY",
+        ProviderId::Openrouter => "UNILLM_PROV_OPENROUTER_KEY",
+        ProviderId::Deepseek => "UNILLM_PROV_DEEPSEEK_KEY",
     }
 }
 
@@ -89,10 +90,11 @@ pub fn from_env() -> Config {
         ProviderId::Openrouter,
         ProviderId::Deepseek,
     ] {
-        let (key_var, default_base) = provider_env(provider);
+        let key_var = provider_env(provider);
         if let Ok(api_key) = env::var(key_var) {
             let base_var = format!("{}_BASE_URL", key_var.trim_end_matches("_KEY"));
-            let base_url = env::var(&base_var).unwrap_or_else(|_| default_base.into());
+            let base_url = env::var(&base_var)
+                .unwrap_or_else(|_| unillm_core::default_base_url(provider).into());
             upstreams.insert(provider, Upstream { api_key, base_url });
         }
     }

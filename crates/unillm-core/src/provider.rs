@@ -39,11 +39,11 @@ pub struct ProviderConfig {
 impl ProviderConfig {
     /// Pick the natural base URL, dialect, and mandatory headers for a provider (`DESIGN.md` §5.6).
     pub fn new(provider: ProviderId, api_key: impl Into<String>) -> Self {
-        let (base_url, dialect) = match provider {
-            ProviderId::Openai => ("https://api.openai.com/v1", Dialect::ChatCompletions),
-            ProviderId::Anthropic => ("https://api.anthropic.com/v1", Dialect::Anthropic),
-            ProviderId::Openrouter => ("https://openrouter.ai/api/v1", Dialect::ChatCompletions),
-            ProviderId::Deepseek => ("https://api.deepseek.com", Dialect::ChatCompletions),
+        let dialect = match provider {
+            ProviderId::Openai | ProviderId::Openrouter | ProviderId::Deepseek => {
+                Dialect::ChatCompletions
+            }
+            ProviderId::Anthropic => Dialect::Anthropic,
         };
         let mut default_headers = HashMap::new();
         if provider == ProviderId::Anthropic {
@@ -51,12 +51,23 @@ impl ProviderConfig {
         }
         Self {
             provider,
-            base_url: base_url.to_string(),
+            base_url: default_base_url(provider).to_string(),
             api_key: api_key.into(),
             dialect,
             default_headers,
             request_timeout: None,
         }
+    }
+}
+
+/// The default API base URL for a provider (`DESIGN.md` §5.6). Single source of truth — shared by
+/// [`ProviderConfig::new`] and the proxy's env loader so the endpoints live in exactly one place.
+pub fn default_base_url(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Openai => "https://api.openai.com/v1",
+        ProviderId::Anthropic => "https://api.anthropic.com/v1",
+        ProviderId::Openrouter => "https://openrouter.ai/api/v1",
+        ProviderId::Deepseek => "https://api.deepseek.com",
     }
 }
 

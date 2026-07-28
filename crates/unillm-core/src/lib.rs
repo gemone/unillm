@@ -22,7 +22,7 @@ pub use ir::{
     Breakpoint, CacheControl, CacheStrategy, Content, ContentBlock, ImageSource, Item, ModelRef,
     ProviderId, Request, Response, Role, StopReason, ToolChoice, ToolDef, Ttl, Usage,
 };
-pub use provider::{Dialect, Provider, ProviderConfig};
+pub use provider::{Dialect, Provider, ProviderConfig, default_base_url};
 pub use providers::{Anthropic, ChatCompletions};
 pub use retry::RetryPolicy;
 pub use sse::{SseFrame, SseParser, parse_sse};
