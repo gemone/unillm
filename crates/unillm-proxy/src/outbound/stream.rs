@@ -134,6 +134,12 @@ impl StreamEncoder for CcStreamEncoder {
             StreamEvent::TextDelta { text } => {
                 out.push(data_frame(&self.chunk(json!({ "content": text }), None)));
             }
+            StreamEvent::ReasoningDelta { text } => {
+                // CC reasoning models stream `reasoning_content` deltas (DeepSeek reasoner / v4-flash).
+                out.push(data_frame(
+                    &self.chunk(json!({ "reasoning_content": text }), None),
+                ));
+            }
             StreamEvent::ToolCallDelta {
                 id,
                 arguments_delta,
@@ -233,11 +239,20 @@ impl StreamEncoder for AnthropicStreamEncoder {
                 ));
             }
             StreamEvent::OutputItemAdded { index, item } => {
+                // Anthropic content blocks are strictly sequential — close any open block before the
+                // next opens (the CC decoder emits no per-item Done, so transitions must close).
+                if let Some(prev) = self.cur_block.take() {
+                    out.push(event_frame(
+                        "content_block_stop",
+                        &json!({ "type": "content_block_stop", "index": prev }),
+                    ));
+                }
                 self.cur_block = Some(*index);
                 let block = match item {
                     Item::FunctionCall { id, name, .. } => {
                         json!({ "type": "tool_use", "id": id, "name": name, "input": {} })
                     }
+                    Item::Reasoning { .. } => json!({ "type": "thinking", "thinking": "" }),
                     // Any message (or other) item opens a text block.
                     _ => json!({ "type": "text", "text": "" }),
                 };
@@ -258,6 +273,17 @@ impl StreamEncoder for AnthropicStreamEncoder {
                         "type": "content_block_delta",
                         "index": idx,
                         "delta": { "type": "text_delta", "text": text }
+                    }),
+                ));
+            }
+            StreamEvent::ReasoningDelta { text } => {
+                let idx = self.cur_block.unwrap_or(0);
+                out.push(event_frame(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": { "type": "thinking_delta", "thinking": text }
                     }),
                 ));
             }
@@ -282,6 +308,13 @@ impl StreamEncoder for AnthropicStreamEncoder {
                 self.cur_block = None;
             }
             StreamEvent::Completed { response } => {
+                // Close any still-open block (CC-sourced streams emit no per-item Done).
+                if let Some(prev) = self.cur_block.take() {
+                    out.push(event_frame(
+                        "content_block_stop",
+                        &json!({ "type": "content_block_stop", "index": prev }),
+                    ));
+                }
                 out.push(event_frame(
                     "message_delta",
                     &json!({
@@ -455,5 +488,76 @@ mod tests {
         assert!(frames[0].contains("\"type\":\"created\""));
         assert!(frames[0].contains("\"id\":\"c1\""));
         assert!(frames[0].ends_with("\n\n"));
+    }
+
+    #[test]
+    fn cc_encodes_reasoning_stream() {
+        let mut enc = CcStreamEncoder::new();
+        enc.encode_event(&StreamEvent::Created { response: header() });
+        enc.encode_event(&StreamEvent::OutputItemAdded {
+            index: 0,
+            item: Item::Reasoning {
+                summary: String::new(),
+                encrypted: None,
+            },
+        });
+        let f = enc.encode_event(&StreamEvent::ReasoningDelta { text: "想".into() });
+        assert_eq!(f.len(), 1);
+        assert!(f[0].contains("\"reasoning_content\":\"想\""));
+        // Answer text follows in its own item.
+        enc.encode_event(&StreamEvent::OutputItemAdded {
+            index: 1,
+            item: Item::Message {
+                role: Role::Assistant,
+                content: Content::Text(String::new()),
+            },
+        });
+        let f = enc.encode_event(&StreamEvent::TextDelta { text: "答".into() });
+        assert!(f[0].contains("\"content\":\"答\""));
+    }
+
+    #[test]
+    fn anthropic_encodes_reasoning_stream() {
+        let mut enc = AnthropicStreamEncoder::new();
+        enc.encode_event(&StreamEvent::Created { response: header() });
+        // Thinking block opens.
+        let f = enc.encode_event(&StreamEvent::OutputItemAdded {
+            index: 0,
+            item: Item::Reasoning {
+                summary: String::new(),
+                encrypted: None,
+            },
+        });
+        assert!(f[0].contains("content_block_start"));
+        assert!(f[0].contains("\"type\":\"thinking\""));
+        let f = enc.encode_event(&StreamEvent::ReasoningDelta { text: "想".into() });
+        assert!(f[0].contains("thinking_delta"));
+        assert!(f[0].contains("\"thinking\":\"想\""));
+        // Transitioning to the text block auto-closes the thinking block.
+        let f = enc.encode_event(&StreamEvent::OutputItemAdded {
+            index: 1,
+            item: Item::Message {
+                role: Role::Assistant,
+                content: Content::Text(String::new()),
+            },
+        });
+        assert!(
+            f.iter()
+                .any(|s| s.contains("content_block_stop") && s.contains("\"index\":0"))
+        );
+        assert!(
+            f.iter()
+                .any(|s| s.contains("content_block_start") && s.contains("\"type\":\"text\""))
+        );
+        enc.encode_event(&StreamEvent::TextDelta { text: "答".into() });
+        // Completed closes the still-open text block.
+        let f = enc.encode_event(&StreamEvent::Completed {
+            response: completed(),
+        });
+        assert!(
+            f.iter()
+                .any(|s| s.contains("content_block_stop") && s.contains("\"index\":1"))
+        );
+        assert!(f.iter().any(|s| s.contains("message_stop")));
     }
 }

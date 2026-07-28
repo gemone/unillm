@@ -34,6 +34,10 @@ pub enum StreamEvent {
     OutputItemAdded { index: u32, item: Item },
     /// Incremental assistant text.
     TextDelta { text: String },
+    /// Incremental chain-of-thought from a reasoning model (e.g. DeepSeek `reasoning_content`).
+    /// Consumers concatenate `text` to reconstruct the full reasoning, which is also carried as an
+    /// `Item::Reasoning` in the terminal `Completed` response.
+    ReasoningDelta { text: String },
     /// Incremental tool-call arguments. Consumers concatenate `arguments_delta` to reconstruct the
     /// full JSON `arguments` string (`DESIGN.md` §8.2).
     ToolCallDelta {

@@ -62,7 +62,14 @@ pub struct CcDecoder {
     provider: ProviderId,
     header: Option<(String, String)>,
     text: String,
+    reasoning: String,
     tools: Vec<ToolAcc>,
+    /// Output items are opened lazily as their first delta arrives, so a reasoning model's
+    /// `reasoning_content` (which streams before `content`) becomes its own `Reasoning` item ahead
+    /// of the answer `Message`, rather than forcing an early empty message.
+    message_open: bool,
+    reasoning_open: bool,
+    next_index: u32,
     stop_reason: Option<StopReason>,
     usage: Option<Value>,
     done: bool,
@@ -74,7 +81,11 @@ impl CcDecoder {
             provider,
             header: None,
             text: String::new(),
+            reasoning: String::new(),
             tools: Vec::new(),
+            message_open: false,
+            reasoning_open: false,
+            next_index: 0,
             stop_reason: None,
             usage: None,
             done: false,
@@ -106,19 +117,44 @@ impl StreamDecoder for CcDecoder {
                     input_usage: None,
                 },
             });
-            out.push(StreamEvent::OutputItemAdded {
-                index: 0,
-                item: Item::Message {
-                    role: Role::Assistant,
-                    content: Content::Text(String::new()),
-                },
-            });
         }
 
         if let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) {
             if let Some(delta) = choice.get("delta") {
+                // Reasoning models (DeepSeek reasoner / v4-flash) stream `reasoning_content` ahead
+                // of `content`; open its item lazily so it precedes the answer Message.
+                if let Some(rc) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                    if !rc.is_empty() {
+                        if !self.reasoning_open {
+                            self.reasoning_open = true;
+                            out.push(StreamEvent::OutputItemAdded {
+                                index: self.next_index,
+                                item: Item::Reasoning {
+                                    summary: String::new(),
+                                    encrypted: None,
+                                },
+                            });
+                            self.next_index += 1;
+                        }
+                        self.reasoning.push_str(rc);
+                        out.push(StreamEvent::ReasoningDelta {
+                            text: rc.to_string(),
+                        });
+                    }
+                }
                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                     if !content.is_empty() {
+                        if !self.message_open {
+                            self.message_open = true;
+                            out.push(StreamEvent::OutputItemAdded {
+                                index: self.next_index,
+                                item: Item::Message {
+                                    role: Role::Assistant,
+                                    content: Content::Text(String::new()),
+                                },
+                            });
+                            self.next_index += 1;
+                        }
                         self.text.push_str(content);
                         out.push(StreamEvent::TextDelta {
                             text: content.to_string(),
@@ -173,8 +209,15 @@ impl StreamDecoder for CcDecoder {
         self.done = true;
         let (id, model) = self.header.clone().unwrap_or_default();
         let mut output = Vec::new();
+        let reasoning = std::mem::take(&mut self.reasoning);
+        if !reasoning.is_empty() {
+            output.push(Item::Reasoning {
+                summary: reasoning,
+                encrypted: None,
+            });
+        }
         let text = std::mem::take(&mut self.text);
-        if !text.is_empty() || self.tools.is_empty() {
+        if !text.is_empty() || self.message_open || (output.is_empty() && self.tools.is_empty()) {
             output.push(Item::Message {
                 role: Role::Assistant,
                 content: Content::Text(text),
@@ -466,6 +509,7 @@ mod tests {
                 StreamEvent::Created { .. } => "created",
                 StreamEvent::OutputItemAdded { .. } => "added",
                 StreamEvent::TextDelta { .. } => "text",
+                StreamEvent::ReasoningDelta { .. } => "reasoning",
                 StreamEvent::ToolCallDelta { .. } => "tool",
                 StreamEvent::OutputItemDone { .. } => "done",
                 StreamEvent::Completed { .. } => "completed",
@@ -534,6 +578,45 @@ mod tests {
         let sse = "data: {\"id\":\"c1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         let ev = decode_cc(ProviderId::Openai, parse_sse(sse));
         assert!(matches!(ev.last(), Some(StreamEvent::Completed { .. })));
+    }
+
+    #[test]
+    fn cc_reasoning_stream_surfaces_reasoning_before_answer() {
+        let sse = concat!(
+            "data: {\"id\":\"ds\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"想\"}}]}\n\n",
+            "data: {\"id\":\"ds\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"一想\"}}]}\n\n",
+            "data: {\"id\":\"ds\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"答\"}}]}\n\n",
+            "data: {\"id\":\"ds\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"案\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let ev = decode_cc(ProviderId::Deepseek, parse_sse(sse));
+        // Reasoning opens first (its own item), then the answer Message.
+        assert_eq!(
+            kinds(&ev),
+            vec![
+                "created",
+                "added",
+                "reasoning",
+                "reasoning",
+                "added",
+                "text",
+                "text",
+                "completed"
+            ]
+        );
+        let completed = match ev.last() {
+            Some(StreamEvent::Completed { response }) => response,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(completed.output.len(), 2);
+        match &completed.output[0] {
+            Item::Reasoning { summary, .. } => assert_eq!(summary, "想一想"),
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        match &completed.output[1] {
+            Item::Message { content, .. } => assert_eq!(content, &Content::Text("答案".into())),
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 
     #[test]
