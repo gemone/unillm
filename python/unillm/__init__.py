@@ -213,9 +213,7 @@ class Response:
 
     @classmethod
     def from_json(cls, raw: str) -> "Response":
-        import json
-
-        return cls.from_dict(json.loads(raw))
+        return cls.from_dict(_json().loads(raw))
 
     @property
     def text(self) -> str:

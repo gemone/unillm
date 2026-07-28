@@ -84,7 +84,7 @@ async def main():
 
     # …or through the proxy (any backend, virtual keys, caching, rate limits, usage logging).
     p = unillm.Client("openai", "sk-unillm-...", base_url="http://localhost:8080")
-    async for ev in await p.stream("claude", input="stream me"):
+    async for ev in p.stream("claude", input="stream me"):
         print(ev)
 
 asyncio.run(main())

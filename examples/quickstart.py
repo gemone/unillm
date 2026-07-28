@@ -24,9 +24,8 @@ async def create_one(c: unillm.Client) -> None:
 
 async def stream_one(c: unillm.Client) -> None:
     print("[stream]    ", end="", flush=True)
-    events = await c.stream("gpt-4o", input="Count from 1 to 3.")
-    async for ev in events:
-        # Canonical stream events (DESIGN.md §4.9). Reasoning models also emit `reasoning_delta`.
+    # `stream` returns an async iterator directly (no `await`); canonical events (DESIGN.md §4.9).
+    async for ev in c.stream("gpt-4o", input="Count from 1 to 3."):
         if ev.get("type") == "text_delta":
             print(ev["text"], end="", flush=True)
     print()
