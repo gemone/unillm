@@ -99,6 +99,17 @@ impl Provider for ChatCompletions {
 
         let mut output = Vec::new();
         if let Some(msg) = choice.get("message") {
+            // Reasoning models (DeepSeek reasoner / v4-flash, etc.) carry chain-of-thought in
+            // `reasoning_content`; surface it as a canonical `Reasoning` item *before* the answer
+            // (`DESIGN.md` §4.2). It is read-only — `build_payload` still drops inbound reasoning.
+            if let Some(rc) = msg.get("reasoning_content").and_then(|v| v.as_str()) {
+                if !rc.is_empty() {
+                    output.push(Item::Reasoning {
+                        summary: rc.to_string(),
+                        encrypted: None,
+                    });
+                }
+            }
             if let Some(content) = msg.get("content") {
                 if !content.is_null() {
                     output.push(Item::Message {
@@ -444,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_deepseek_reasoner_drops_reasoning_content() {
+    fn parse_deepseek_reasoner_maps_reasoning_content() {
         let resp = ChatCompletions::new(ProviderId::Deepseek)
             .parse_response(&json!({
                 "id":"ds-1","model":"deepseek-reasoner",
@@ -452,8 +463,21 @@ mod tests {
                 "usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_cache_hit_tokens":30,"prompt_cache_miss_tokens":70}
             }))
             .unwrap();
-        // reasoning_content is read-only and must not appear in canonical output (DESIGN.md §5.5).
-        assert_eq!(resp.output.len(), 1);
+        // reasoning_content is surfaced as a Reasoning item before the answer Message.
+        assert_eq!(resp.output.len(), 2);
+        match &resp.output[0] {
+            Item::Reasoning { summary, encrypted } => {
+                assert_eq!(summary, "hidden");
+                assert_eq!(encrypted, &None);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        match &resp.output[1] {
+            Item::Message { content, .. } => {
+                assert_eq!(content, &Content::Text("answer".to_string()));
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
         assert_eq!(resp.usage.cache_read, 30);
         assert_eq!(resp.usage.input_tokens, 70);
     }

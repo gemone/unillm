@@ -13,6 +13,11 @@ pub fn build_anthropic_response(resp: &Response) -> Value {
                 role: Role::Assistant,
                 content: c,
             } => push_assistant_blocks(c, &mut content),
+            // Surface chain-of-thought from reasoning models as an Anthropic `thinking` block
+            // (`DESIGN.md` §2.4, §5.4). Emitted before the text block (output order is preserved).
+            Item::Reasoning { summary, .. } => {
+                content.push(json!({ "type": "thinking", "thinking": summary }));
+            }
             Item::FunctionCall {
                 id,
                 name,
@@ -125,6 +130,32 @@ mod tests {
         assert_eq!(rebuilt["content"][1]["type"], "tool_use");
         // input round-trips through the arguments-string ↔ object boundary.
         assert_eq!(rebuilt["content"][1]["input"], json!({ "q": "sf" }));
+    }
+
+    #[test]
+    fn reasoning_surfaces_as_thinking_block() {
+        // A DeepSeek reasoning response → canonical → Anthropic egress emits a `thinking` block
+        // before the text block.
+        let cc_native = json!({
+            "id": "ds-1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "answer", "reasoning_content": "thinking..." },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let resp = unillm_core::ChatCompletions::new(unillm_core::ProviderId::Deepseek)
+            .parse_response(&cc_native)
+            .unwrap();
+        let an = build_anthropic_response(&resp);
+        let content = an["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "thinking...");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "answer");
     }
 
     #[test]

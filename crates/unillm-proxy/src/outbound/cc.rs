@@ -7,6 +7,7 @@ use unillm_core::ir::{Content, ContentBlock, Item, Response, Role, StopReason, U
 /// Build a Chat Completions response body from a canonical [`Response`] (`DESIGN.md` §2.2, §5.4).
 pub fn build_cc_response(resp: &Response) -> Value {
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     for item in &resp.output {
         match item {
@@ -14,6 +15,9 @@ pub fn build_cc_response(resp: &Response) -> Value {
                 role: Role::Assistant,
                 content,
             } => append_assistant_text(content, &mut text),
+            // Surface chain-of-thought from reasoning models (DeepSeek reasoner / v4-flash, …) as
+            // CC `reasoning_content` on the assistant message (`DESIGN.md` §2.5, §5.4).
+            Item::Reasoning { summary, .. } => reasoning.push_str(summary),
             Item::FunctionCall {
                 id,
                 name,
@@ -29,6 +33,9 @@ pub fn build_cc_response(resp: &Response) -> Value {
 
     let mut message = Map::new();
     message.insert("role".into(), json!("assistant"));
+    if !reasoning.is_empty() {
+        message.insert("reasoning_content".into(), json!(reasoning));
+    }
     if tool_calls.is_empty() {
         message.insert("content".into(), json!(text));
     } else {
@@ -166,6 +173,30 @@ mod tests {
             rebuilt["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"q\":\"sf\"}"
         );
+    }
+
+    #[test]
+    fn reasoning_surfaces_as_reasoning_content() {
+        // A DeepSeek reasoning response → canonical → CC egress keeps `reasoning_content`.
+        let native = json!({
+            "id": "ds-1",
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "answer", "reasoning_content": "thinking..." },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5 }
+        });
+        let resp = ChatCompletions::new(ProviderId::Deepseek)
+            .parse_response(&native)
+            .unwrap();
+        let rebuilt = build_cc_response(&resp);
+        assert_eq!(
+            rebuilt["choices"][0]["message"]["reasoning_content"],
+            "thinking..."
+        );
+        assert_eq!(rebuilt["choices"][0]["message"]["content"], "answer");
     }
 
     #[test]
