@@ -36,6 +36,13 @@ impl PostgresStore {
         run_postgres(&pool).await?;
         Ok(Self { pool })
     }
+
+    /// Like [`connect`](Self::connect) but skips migrations — for prod where migrations run via
+    /// `sqlx migrate run` in CI (`UNILLM_RUN_MIGRATIONS=false`, `DESIGN.md` §21).
+    pub async fn connect_without_migrations(url: &str) -> Result<Self, StoreError> {
+        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        Ok(Self { pool })
+    }
 }
 
 // --- row mapping --------------------------------------------------------------

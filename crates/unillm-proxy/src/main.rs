@@ -35,29 +35,76 @@ async fn main() {
     }
 }
 
+/// The four storage trait objects the proxy wires into [`Stores`].
+type StoreArcs = (
+    Arc<dyn KeyStore>,
+    Arc<dyn RouteStore>,
+    Arc<dyn ModelStore>,
+    Arc<dyn LogStore>,
+);
+
+/// Open the storage backends for `database_url` (`DESIGN.md` §11.2): `postgres://` → `PostgresStore`
+/// (requires the `postgres` feature), else `SqliteStore`. Migrations apply unless `run_migrations`
+/// is false (`DESIGN.md` §21).
+async fn open_stores(url: &str, run_migrations: bool) -> Result<StoreArcs, String> {
+    if url.starts_with("postgres") {
+        open_postgres(url, run_migrations).await
+    } else {
+        open_sqlite(url, run_migrations).await
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn open_postgres(url: &str, run_migrations: bool) -> Result<StoreArcs, String> {
+    let s = if run_migrations {
+        unillm_storage::PostgresStore::connect(url).await
+    } else {
+        unillm_storage::PostgresStore::connect_without_migrations(url).await
+    }
+    .map_err(|e| e.to_string())?;
+    let s = Arc::new(s);
+    Ok((s.clone(), s.clone(), s.clone(), s))
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn open_postgres(url: &str, _run_migrations: bool) -> Result<StoreArcs, String> {
+    Err(format!(
+        "database_url '{url}' is PostgreSQL but the proxy was built without the `postgres` feature; \
+         rebuild with --features postgres"
+    ))
+}
+
+async fn open_sqlite(url: &str, run_migrations: bool) -> Result<StoreArcs, String> {
+    let s = if run_migrations {
+        SqliteStore::connect(url).await
+    } else {
+        SqliteStore::connect_without_migrations(url).await
+    }
+    .map_err(|e| e.to_string())?;
+    let s = Arc::new(s);
+    Ok((s.clone(), s.clone(), s.clone(), s))
+}
+
 /// Load config, open storage + seed a dev key, build per-provider backend clients, and serve.
 async fn serve() {
     let cfg = config::from_env();
 
-    let store = match if cfg.run_migrations {
-        SqliteStore::connect(&cfg.database_url).await
-    } else {
-        SqliteStore::connect_without_migrations(&cfg.database_url).await
-    } {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("FATAL: could not open storage at {}: {e}", cfg.database_url);
-            return;
-        }
-    };
+    let (keys, routes, models, logs) =
+        match open_stores(&cfg.database_url, cfg.run_migrations).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("FATAL: could not open storage at {}: {e}", cfg.database_url);
+                return;
+            }
+        };
 
     // Dev bootstrap: seed a key from UNILLM_SEED_KEY so the data plane is callable before the admin
     // REST API exists (M4.5). No-op if the key already exists.
     if let Some(secret) = &cfg.seed_key {
         let hash = hash_secret(secret, &cfg.key_pepper);
-        if store.find_by_hash(&hash).await.unwrap_or(None).is_none() {
+        if keys.find_by_hash(&hash).await.unwrap_or(None).is_none() {
             let scopes = SEED_SCOPES.iter().map(|s| (*s).to_string()).collect();
-            match store
+            match keys
                 .create_key(NewVirtualKey {
                     key_hash: hash,
                     key_prefix: key_prefix(secret),
@@ -95,10 +142,6 @@ async fn serve() {
         eprintln!("WARNING: no upstream providers configured (set UNILLM_PROV_*_KEY env vars)");
     }
 
-    let keys: Arc<dyn KeyStore> = store.clone();
-    let routes: Arc<dyn RouteStore> = store.clone();
-    let models: Arc<dyn ModelStore> = store.clone();
-    let logs: Arc<dyn LogStore> = store;
     let stores = Stores {
         keys,
         routes,
