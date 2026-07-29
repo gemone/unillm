@@ -7,7 +7,7 @@ All notable changes to this project are documented here. The format is based on
 The full design contract lives in [`DESIGN.md`](./DESIGN.md); this file records what each
 release actually shipped.
 
-## [1.0.0] — 2026-07-27
+## [0.1.0] — 2026-07-27
 
 First stable release. A unified LLM framework: a shared Rust core, a Python SDK, and a
 standalone translator proxy covering **OpenAI, Anthropic, OpenRouter, and DeepSeek**.
@@ -72,4 +72,4 @@ Responses dialect (`DESIGN.md` §5.3/§6.5), semantic cache (§7.4), OpenRouter 
 fan-out (§2.6), `n>1` (§4.6), embeddings/reranking, WebSocket/gRPC. Redis-backed rate-limit
 and cache primaries (in-memory now, trait-pluggable).
 
-[1.0.0]: https://github.com/gemone/unillm/releases/tag/v1.0.0
+[0.1.0]: https://github.com/gemone/unillm/releases/tag/v0.1.0

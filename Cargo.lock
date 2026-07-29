@@ -2126,7 +2126,7 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unillm-core"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "futures",
@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "unillm-proxy"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "unillm-storage"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
