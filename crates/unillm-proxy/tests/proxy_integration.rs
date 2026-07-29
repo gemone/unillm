@@ -2340,3 +2340,73 @@ async fn malformed_json_body_is_400() {
         .unwrap();
     assert_eq!(r.status(), 400);
 }
+
+#[tokio::test]
+async fn cache_hit_respects_disabled_model() {
+    // A model disabled in the catalog after the miss must not be served from cache.
+    let upstream = MockServer::start().await;
+    mount_cc_completion(&upstream, 1).await; // only the miss reaches upstream
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    store
+        .upsert_model(NewModel {
+            provider: "openai".into(),
+            native_model: "gpt-4o".into(),
+            display_name: "GPT-4o".into(),
+            context_window: None,
+            max_output: None,
+            price_in: None,
+            price_out: None,
+            price_cache_read: None,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let url =
+        start_proxy_with_cache(clients, store.clone(), None, default_limits(), cache_on()).await;
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let hdr = format!("Bearer {secret}");
+    // Miss → cached.
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.headers().get("x-unillm-cache").unwrap(), "MISS");
+    // Disable the model in the catalog.
+    store
+        .upsert_model(NewModel {
+            provider: "openai".into(),
+            native_model: "gpt-4o".into(),
+            display_name: "GPT-4o".into(),
+            context_window: None,
+            max_output: None,
+            price_in: None,
+            price_out: None,
+            price_cache_read: None,
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    // Second request: should be 400 (model disabled), NOT a cache HIT serving the old response.
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.status(),
+        400,
+        "disabled model should not be served from cache"
+    );
+}

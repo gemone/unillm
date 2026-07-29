@@ -284,6 +284,18 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             if let Err(e) = check_allowlist(&key, &crate::route::model_id(&canonical.model)) {
                 return error_response(&e);
             }
+            // A model disabled in the catalog after the miss must not be served from cache.
+            if let Err(e) = check_catalog_enabled(
+                &*state.stores.models,
+                &RouteTarget {
+                    provider: cached.provider,
+                    native_model: cached.model.clone(),
+                },
+            )
+            .await
+            {
+                return error_response(&e);
+            }
             // No upstream call; the slot is released by `slot`'s `Drop` on return.
             // Log the hit: status 200, cached=true, no usage (tokens were spent on the miss).
             let mut rec = LogContext::for_request(
