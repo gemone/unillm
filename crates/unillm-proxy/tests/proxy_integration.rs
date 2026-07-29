@@ -31,6 +31,14 @@ fn default_limits() -> RequestLimits {
     }
 }
 
+/// A cache-enabled config for the cache-hit tests (60s TTL).
+fn cache_on() -> CacheConfig {
+    CacheConfig {
+        enabled: true,
+        ttl: std::time::Duration::from_secs(60),
+    }
+}
+
 /// Fresh in-proc SQLite store (migrations applied).
 async fn mem_store() -> Arc<SqliteStore> {
     Arc::new(SqliteStore::connect("sqlite::memory:").await.unwrap())
@@ -1615,17 +1623,8 @@ async fn cache_hit_short_circuits_with_header() {
     let store = mem_store().await;
     let secret = seed_key(&store, &["data"]).await;
     seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
-    let url = start_proxy_with_cache(
-        clients,
-        store.clone(),
-        None,
-        default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
-    )
-    .await;
+    let url =
+        start_proxy_with_cache(clients, store.clone(), None, default_limits(), cache_on()).await;
 
     let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
     let hdr = format!("Bearer {secret}");
@@ -1670,17 +1669,7 @@ async fn cache_key_is_scoped_to_virtual_key() {
     let secret_a = seed_key(&store, &["data"]).await;
     let secret_b = seed_key(&store, &["data"]).await;
     seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
-    let url = start_proxy_with_cache(
-        clients,
-        store,
-        None,
-        default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
-    )
-    .await;
+    let url = start_proxy_with_cache(clients, store, None, default_limits(), cache_on()).await;
 
     let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
 
@@ -1733,10 +1722,7 @@ async fn cache_invalidate_flushes_entries() {
         store,
         Some(ADMIN.into()),
         default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
+        cache_on(),
     )
     .await;
 
@@ -1795,17 +1781,7 @@ async fn stream_bypasses_cache() {
     let store = mem_store().await;
     let secret = seed_key(&store, &["data"]).await;
     seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
-    let url = start_proxy_with_cache(
-        clients,
-        store,
-        None,
-        default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
-    )
-    .await;
+    let url = start_proxy_with_cache(clients, store, None, default_limits(), cache_on()).await;
 
     let r = http()
         .post(format!("{url}/v1/chat/completions"))
@@ -1945,17 +1921,7 @@ async fn cache_replays_tool_call_on_hit() {
     let store = mem_store().await;
     let secret = seed_key(&store, &["data"]).await;
     seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
-    let url = start_proxy_with_cache(
-        clients,
-        store,
-        None,
-        default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
-    )
-    .await;
+    let url = start_proxy_with_cache(clients, store, None, default_limits(), cache_on()).await;
     let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"weather?"}],
         "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]});
     let hdr = format!("Bearer {secret}");
@@ -2053,17 +2019,7 @@ async fn cache_hit_serves_requested_outbound_format() {
     let store = mem_store().await;
     let secret = seed_key(&store, &["data"]).await;
     seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
-    let url = start_proxy_with_cache(
-        clients,
-        store,
-        None,
-        default_limits(),
-        CacheConfig {
-            enabled: true,
-            ttl: std::time::Duration::from_secs(60),
-        },
-    )
-    .await;
+    let url = start_proxy_with_cache(clients, store, None, default_limits(), cache_on()).await;
     let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
     let hdr = format!("Bearer {secret}");
     let r1 = http()
