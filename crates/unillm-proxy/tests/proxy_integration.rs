@@ -1909,3 +1909,222 @@ async fn openapi_and_docs_are_served() {
             .contains("data-url=\"/openapi.json\"")
     );
 }
+
+// --- combination / 1.0-readiness coverage --------------------------------------
+
+#[tokio::test]
+async fn cache_replays_tool_call_on_hit() {
+    // A tool-call response must round-trip through the cache intact.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"q\":\"sf\"}"}}
+            ]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store,
+        None,
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"weather?"}],
+        "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]});
+    let hdr = format!("Bearer {secret}");
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.headers().get("x-unillm-cache").unwrap(), "MISS");
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.headers().get("x-unillm-cache").unwrap(), "HIT");
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(
+        b2["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+}
+
+#[tokio::test]
+async fn fallback_logs_answering_target() {
+    // Primary 500 → fallback answers; the request log must record the FALLBACK provider/model.
+    let primary = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_json(json!({"error": {"message": "boom"}})),
+        )
+        .mount(&primary)
+        .await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c", "model": "deepseek-chat", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&fallback)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, primary.uri()),
+    );
+    clients.insert(
+        ProviderId::Deepseek,
+        client_for(ProviderId::Deepseek, fallback.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(
+        &store,
+        "m",
+        "openai",
+        "gpt-4o",
+        vec![FallbackTarget {
+            provider: "deepseek".into(),
+            native_model: "deepseek-chat".into(),
+        }],
+    )
+    .await;
+    let url = start_proxy(clients, store.clone(), None, default_limits()).await;
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"m","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let logs = await_log(&store).await;
+    assert_eq!(logs[0].provider, "deepseek"); // the fallback answered, not the primary openai
+    assert_eq!(logs[0].model, "deepseek-chat");
+}
+
+#[tokio::test]
+async fn cache_hit_serves_requested_outbound_format() {
+    // The cached value is canonical; a hit re-translates to whatever outbound format the client asks
+    // for (proves cross-format caching — the key excludes outbound format by design).
+    let upstream = MockServer::start().await;
+    mount_cc_completion(&upstream, 1).await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    seed_route(&store, "gpt-4o", "openai", "gpt-4o", vec![]).await;
+    let url = start_proxy_with_cache(
+        clients,
+        store,
+        None,
+        default_limits(),
+        CacheConfig {
+            enabled: true,
+            ttl: std::time::Duration::from_secs(60),
+        },
+    )
+    .await;
+    let body = json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]});
+    let hdr = format!("Bearer {secret}");
+    let r1 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.headers().get("x-unillm-cache").unwrap(), "MISS");
+    // Hit, but request Anthropic outbound → the cached canonical response is re-translated.
+    let r2 = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .header("x-unillm-response-format", "anthropic")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.headers().get("x-unillm-cache").unwrap(), "HIT");
+    let b2: Value = r2.json().await.unwrap();
+    assert_eq!(b2["type"], "message"); // Anthropic shape, not CC choices[]
+    assert_eq!(b2["content"][0]["text"], "cached!");
+}
+
+#[tokio::test]
+async fn usage_grouped_by_model() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let store = mem_store().await;
+    let secret = seed_key(&store, &["data"]).await;
+    // Two distinct models → two group_by=model buckets.
+    seed_route(&store, "a", "openai", "gpt-4o", vec![]).await;
+    seed_route(&store, "b", "openai", "gpt-4o-mini", vec![]).await;
+    let url = start_proxy(clients, store.clone(), Some(ADMIN.into()), default_limits()).await;
+    let hdr = format!("Bearer {secret}");
+    for m in ["a", "b"] {
+        http()
+            .post(format!("{url}/v1/chat/completions"))
+            .header("authorization", &hdr)
+            .json(&json!({"model": m, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+    }
+    await_log(&store).await;
+    let r = http()
+        .get(format!("{url}/admin/usage?group_by=model"))
+        .header("authorization", admin_hdr())
+        .send()
+        .await
+        .unwrap();
+    let buckets: Vec<Value> = r.json().await.unwrap();
+    let models: Vec<String> = buckets
+        .iter()
+        .map(|b| b["key"].as_str().unwrap().to_string())
+        .collect();
+    assert!(models.contains(&"gpt-4o".to_string()));
+    assert!(models.contains(&"gpt-4o-mini".to_string()));
+}

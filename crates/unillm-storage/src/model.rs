@@ -220,3 +220,50 @@ pub struct UsageBucket {
     pub cache_creation: i64,
     pub cost_usd: Option<f64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_by_parse_all_dims_and_case_insensitive() {
+        assert_eq!(GroupBy::parse("key"), Some(GroupBy::Key));
+        assert_eq!(GroupBy::parse("model"), Some(GroupBy::Model));
+        assert_eq!(GroupBy::parse("provider"), Some(GroupBy::Provider));
+        assert_eq!(GroupBy::parse("day"), Some(GroupBy::Day));
+        // case-insensitive
+        assert_eq!(GroupBy::parse("KEY"), Some(GroupBy::Key));
+        assert_eq!(GroupBy::parse("Provider"), Some(GroupBy::Provider));
+        // invalid
+        assert_eq!(GroupBy::parse("nonsense"), None);
+        assert_eq!(GroupBy::parse(""), None);
+    }
+
+    /// A `VirtualKey` with only the lifecycle fields populated (what `is_active` reads).
+    fn vk(revoked_at: Option<DateTime<Utc>>, expires_at: Option<DateTime<Utc>>) -> VirtualKey {
+        VirtualKey {
+            id: Uuid::new_v4(),
+            key_hash: "h".into(),
+            key_prefix: "p".into(),
+            tenant_id: Uuid::new_v4(),
+            scopes: vec![],
+            model_allowlist: None,
+            budget_daily_tokens: None,
+            rpm: None,
+            tpm: None,
+            max_concurrency: None,
+            created_at: Utc::now(),
+            expires_at,
+            revoked_at,
+        }
+    }
+
+    #[test]
+    fn is_active_revoked_or_expired() {
+        let now = Utc::now();
+        assert!(vk(None, None).is_active(now)); // fresh key
+        assert!(vk(None, Some(now + chrono::Duration::hours(1))).is_active(now)); // future expiry
+        assert!(!vk(Some(now), None).is_active(now)); // revoked
+        assert!(!vk(None, Some(now - chrono::Duration::seconds(1))).is_active(now)); // expired
+    }
+}

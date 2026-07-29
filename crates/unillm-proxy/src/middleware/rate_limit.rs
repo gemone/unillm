@@ -110,3 +110,36 @@ impl Drop for ReleaseGuard {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[test]
+    fn estimate_tokens_is_bytes_over_four_plus_max_output() {
+        let e = estimate_tokens(8, Some(50));
+        assert_eq!(e.prompt, 2);
+        assert_eq!(e.max_output, 50);
+        // No max_tokens → default 1024; empty body → 0 prompt tokens.
+        let e = estimate_tokens(0, None);
+        assert_eq!(e.prompt, 0);
+        assert_eq!(e.max_output, 1024);
+    }
+
+    #[test]
+    fn apply_rate_headers_sets_all_three() {
+        let mut h = HeaderMap::new();
+        apply_rate_headers(
+            &mut h,
+            &RateHeaders {
+                limit: 100,
+                remaining: 7,
+                reset_seconds: 30,
+            },
+        );
+        assert_eq!(h.get("x-unillm-ratelimit-limit").unwrap(), "100");
+        assert_eq!(h.get("x-unillm-ratelimit-remaining").unwrap(), "7");
+        assert_eq!(h.get("x-unillm-ratelimit-reset").unwrap(), "30");
+    }
+}

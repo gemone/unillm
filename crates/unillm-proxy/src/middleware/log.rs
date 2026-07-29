@@ -186,3 +186,48 @@ impl StreamLogger {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inbound::Format;
+
+    #[test]
+    fn usage_from_maps_all_fields() {
+        let u = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read: 3,
+            cache_creation: 1,
+            cost_usd: Some(0.1),
+        };
+        let n = usage_from(&u);
+        assert_eq!(n.input_tokens, 10);
+        assert_eq!(n.output_tokens, 5);
+        assert_eq!(n.cache_read, 3);
+        assert_eq!(n.cache_creation, 1);
+        assert_eq!(n.cost_usd, Some(0.1));
+    }
+
+    #[test]
+    fn log_context_request_log_shape() {
+        let ctx = LogContext::for_request(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "openai",
+            "gpt-4o",
+            Format::OpenaiChat,
+            Format::OpenaiChat,
+            Instant::now(),
+        );
+        let rec = ctx.new_request_log(200);
+        assert_eq!(rec.provider, "openai");
+        assert_eq!(rec.model, "gpt-4o");
+        assert_eq!(rec.inbound_format, "openai_chat");
+        assert_eq!(rec.outbound_format, "openai_chat");
+        assert_eq!(rec.status, 200);
+        assert!(!rec.cached);
+        assert!(rec.latency_ms.is_some());
+        assert!(!rec.request_id.is_empty());
+    }
+}

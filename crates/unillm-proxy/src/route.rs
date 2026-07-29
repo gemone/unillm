@@ -91,4 +91,72 @@ mod tests {
             Err(CoreError::InvalidRequest { .. })
         ));
     }
+
+    #[test]
+    fn model_id_alias_vs_explicit() {
+        assert_eq!(model_id(&ModelRef::Alias("gpt-4o".into())), "gpt-4o");
+        assert_eq!(
+            model_id(&ModelRef::Explicit {
+                provider: ProviderId::Openai,
+                model: "gpt-4o".into()
+            }),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn row_to_chain_preserves_fallback_order() {
+        let row = RouteRow {
+            alias: "x".into(),
+            tenant_id: None,
+            provider: "openai".into(),
+            native_model: "a".into(),
+            fallback: vec![
+                FallbackTarget {
+                    provider: "anthropic".into(),
+                    native_model: "b".into(),
+                },
+                FallbackTarget {
+                    provider: "deepseek".into(),
+                    native_model: "c".into(),
+                },
+            ],
+            priority: 0,
+            enabled: true,
+        };
+        let chain = row_to_chain(&row).unwrap();
+        let got: Vec<_> = chain
+            .iter()
+            .map(|t| (t.provider, t.native_model.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (ProviderId::Openai, "a"),
+                (ProviderId::Anthropic, "b"),
+                (ProviderId::Deepseek, "c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn row_to_chain_bad_fallback_provider_errors() {
+        // A bad provider in a *fallback* entry also fails fast.
+        let row = RouteRow {
+            alias: "x".into(),
+            tenant_id: None,
+            provider: "openai".into(),
+            native_model: "a".into(),
+            fallback: vec![FallbackTarget {
+                provider: "bogus".into(),
+                native_model: "b".into(),
+            }],
+            priority: 0,
+            enabled: true,
+        };
+        assert!(matches!(
+            row_to_chain(&row),
+            Err(CoreError::InvalidRequest { .. })
+        ));
+    }
 }

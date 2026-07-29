@@ -419,4 +419,104 @@ mod tests {
         .await;
         assert!(err.is_err());
     }
+
+    #[tokio::test]
+    async fn cli_models_create_list_delete() {
+        let (base, _store) = spawn_admin_proxy("admin-secret").await;
+        run_admin_at(
+            AdminCmd::Models {
+                action: CrudCmd::Create {
+                    json: json!({"provider":"openai","native_model":"gpt-test","display_name":"T"})
+                        .to_string(),
+                },
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("models create");
+        run_admin_at(
+            AdminCmd::Models {
+                action: CrudCmd::List,
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("models list");
+        run_admin_at(
+            AdminCmd::Models {
+                action: CrudCmd::Delete {
+                    args: vec!["openai".into(), "gpt-test".into()],
+                },
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("models delete");
+    }
+
+    #[tokio::test]
+    async fn cli_routes_usage_logs() {
+        let (base, _store) = spawn_admin_proxy("admin-secret").await;
+        run_admin_at(
+            AdminCmd::Routes {
+                action: CrudCmd::Create {
+                    json: json!({"alias":"gpt-4o","provider":"openai","native_model":"gpt-4o"})
+                        .to_string(),
+                },
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("routes create");
+        run_admin_at(
+            AdminCmd::Routes {
+                action: CrudCmd::List,
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("routes list");
+        run_admin_at(
+            AdminCmd::Usage {
+                key_id: None,
+                model: None,
+                group_by: Some("model".into()),
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("usage");
+        run_admin_at(
+            AdminCmd::Logs {
+                key_id: None,
+                limit: 10,
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("logs");
+    }
+
+    #[tokio::test]
+    async fn cli_cache_invalidate() {
+        let (base, _store) = spawn_admin_proxy("admin-secret").await;
+        // Flush-all on an empty cache → 0 invalidated, but the command wiring must succeed.
+        run_admin_at(
+            AdminCmd::Cache {
+                scope: None,
+                key_hash: None,
+            },
+            &base,
+            "admin-secret",
+        )
+        .await
+        .expect("cache invalidate");
+    }
 }

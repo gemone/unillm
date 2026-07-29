@@ -92,3 +92,91 @@ pub fn require_admin(token: Option<&str>, admin_token: &Option<String>) -> Resul
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, Uri};
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    /// A minimal `VirtualKey` carrying only `scopes` (the field `require_scope` reads).
+    fn vk(scopes: &[&str]) -> VirtualKey {
+        VirtualKey {
+            id: Uuid::new_v4(),
+            key_hash: "h".into(),
+            key_prefix: "p".into(),
+            tenant_id: Uuid::new_v4(),
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            model_allowlist: None,
+            budget_daily_tokens: None,
+            rpm: None,
+            tpm: None,
+            max_concurrency: None,
+            created_at: Utc::now(),
+            expires_at: None,
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn reject_query_key_flags_key_and_api_key() {
+        // §16: keys must never travel as query params.
+        assert!(reject_query_key(&"/x?key=sk-1".parse::<Uri>().unwrap()).is_err());
+        assert!(reject_query_key(&"/x?api_key=sk-1".parse::<Uri>().unwrap()).is_err());
+        // a non-key param, or no query at all, is allowed.
+        assert!(reject_query_key(&"/x?model=gpt".parse::<Uri>().unwrap()).is_ok());
+        assert!(reject_query_key(&"/x".parse::<Uri>().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn extract_token_bearer_then_header() {
+        // Bearer from Authorization.
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer sk-abc"));
+        assert_eq!(extract_token(&h).as_deref(), Some("sk-abc"));
+
+        // Falls back to X-Unillm-Key.
+        let mut h = HeaderMap::new();
+        h.insert("x-unillm-key", HeaderValue::from_static("sk-xyz"));
+        assert_eq!(extract_token(&h).as_deref(), Some("sk-xyz"));
+
+        // Authorization wins when both are present.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer sk-bearer"),
+        );
+        h.insert("x-unillm-key", HeaderValue::from_static("sk-hdr"));
+        assert_eq!(extract_token(&h).as_deref(), Some("sk-bearer"));
+
+        // Missing → None.
+        assert!(extract_token(&HeaderMap::new()).is_none());
+
+        // Whitespace is trimmed.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer  sk-spaced "),
+        );
+        assert_eq!(extract_token(&h).as_deref(), Some("sk-spaced"));
+    }
+
+    #[test]
+    fn require_scope_membership() {
+        let key = vk(&["data", "read-usage"]);
+        assert!(require_scope(&key, "data").is_ok());
+        assert!(require_scope(&key, "read-usage").is_ok());
+        assert!(require_scope(&key, "admin").is_err());
+    }
+
+    #[test]
+    fn require_admin_constant_time_match() {
+        let tok = Some(String::from("s3cret"));
+        assert!(require_admin(Some("s3cret"), &tok).is_ok());
+        assert!(require_admin(Some("wrong"), &tok).is_err());
+        assert!(require_admin(None, &tok).is_err());
+        // No admin token configured → always denied (secure default).
+        assert!(require_admin(Some("s3cret"), &None).is_err());
+    }
+}
