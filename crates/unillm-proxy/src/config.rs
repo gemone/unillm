@@ -58,6 +58,9 @@ pub struct Config {
     pub limits: RequestLimits,
     /// Exact-hash response cache (`DESIGN.md` §7.4, §14.1). Opt-in; off by default.
     pub cache: crate::middleware::cache::CacheConfig,
+    /// Apply DB migrations at startup (`DESIGN.md` §21). Default `true`; set
+    /// `UNILLM_RUN_MIGRATIONS=false` to skip (run them via `sqlx migrate run` in CI instead).
+    pub run_migrations: bool,
 }
 
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
@@ -122,5 +125,8 @@ pub fn from_env() -> Config {
         seed_key,
         limits: RequestLimits::from_env(),
         cache: crate::middleware::cache::CacheConfig::from_env(),
+        run_migrations: env::var("UNILLM_RUN_MIGRATIONS")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true),
     }
 }

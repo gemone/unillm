@@ -2287,3 +2287,56 @@ async fn stream_reasoning_surfaces_in_sse() {
     assert!(body.contains("\"content\":\"答案"));
     assert!(body.ends_with("data: [DONE]\n\n"));
 }
+
+#[tokio::test]
+async fn request_id_is_echoed_and_accepted() {
+    // §17: an inbound X-Unillm-Request-Id is preserved; without one, a fresh id is echoed back.
+    let (url, secret) = authed_proxy(HashMap::new(), &[]).await;
+    let hdr = format!("Bearer {secret}");
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .json(&json!({"model":"nope","messages":[]})) // 404 (no route) — still echoes the id
+        .send()
+        .await
+        .unwrap();
+    let echoed = r
+        .headers()
+        .get("x-unillm-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !echoed.is_empty(),
+        "a request id should be generated and echoed"
+    );
+
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", &hdr)
+        .header("x-unillm-request-id", "client-req-123")
+        .json(&json!({"model":"nope","messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.headers().get("x-unillm-request-id").unwrap(),
+        "client-req-123"
+    );
+}
+
+#[tokio::test]
+async fn malformed_json_body_is_400() {
+    // A client-side malformed body is a 400 invalid_request, not a 500.
+    let (url, secret) = authed_proxy(HashMap::new(), &[]).await;
+    let r = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .header("content-type", "application/json")
+        .body("{not valid json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+}

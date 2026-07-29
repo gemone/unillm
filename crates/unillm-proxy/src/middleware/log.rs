@@ -37,7 +37,9 @@ impl LogContext {
     /// a fresh request id, the key/tenant, the inbound/outbound wire names, and the start instant.
     /// Used by both the upstream path (provider/model from the resolved route) and the cache-hit
     /// path (from the cached response) so the field set lives in one place.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_request(
+        request_id: String,
         virtual_key_id: Uuid,
         tenant_id: Uuid,
         provider: impl Into<String>,
@@ -47,7 +49,7 @@ impl LogContext {
         started: Instant,
     ) -> Self {
         Self {
-            request_id: Uuid::new_v4().to_string(),
+            request_id,
             virtual_key_id,
             tenant_id,
             provider: provider.into(),
@@ -212,6 +214,7 @@ mod tests {
     #[test]
     fn log_context_request_log_shape() {
         let ctx = LogContext::for_request(
+            "req-1".to_string(),
             Uuid::new_v4(),
             Uuid::new_v4(),
             "openai",
@@ -221,6 +224,7 @@ mod tests {
             Instant::now(),
         );
         let rec = ctx.new_request_log(200);
+        assert_eq!(rec.request_id, "req-1");
         assert_eq!(rec.provider, "openai");
         assert_eq!(rec.model, "gpt-4o");
         assert_eq!(rec.inbound_format, "openai_chat");
@@ -228,6 +232,5 @@ mod tests {
         assert_eq!(rec.status, 200);
         assert!(!rec.cached);
         assert!(rec.latency_ms.is_some());
-        assert!(!rec.request_id.is_empty());
     }
 }

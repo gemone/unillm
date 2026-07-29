@@ -16,6 +16,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -108,7 +109,30 @@ pub fn build_app(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi_json))
         .route("/docs", get(docs))
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// The request id (`DESIGN.md` §17): accepted from the inbound `X-Unillm-Request-Id` header or
+/// generated, echoed on the response and stored in the request log. Carried via request extensions.
+#[derive(Clone)]
+struct RequestId(String);
+
+/// Generate/accept the request id and echo it on every response (`DESIGN.md` §17).
+async fn request_id_middleware(mut req: Request, next: Next) -> Response {
+    let id = req
+        .headers()
+        .get("x-unillm-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    req.extensions_mut().insert(RequestId(id.clone()));
+    let mut resp = next.run(req).await;
+    if let Ok(hv) = HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-unillm-request-id", hv);
+    }
+    resp
 }
 
 async fn health() -> impl IntoResponse {
@@ -156,6 +180,12 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let path = req.uri().path().to_string();
     let started = Instant::now();
+    // §17: accept an inbound request id, else generate one (the middleware echoes it on the way out).
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     // §16: never accept API keys as query parameters.
     if let Err(e) = reject_query_key(req.uri()) {
         return error_response(&e);
@@ -196,7 +226,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     let body: Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            return error_response(&CoreError::Serde {
+            return error_response(&CoreError::InvalidRequest {
                 message: format!("invalid JSON body: {e}"),
             });
         }
@@ -251,6 +281,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
             // No upstream call; the slot is released by `slot`'s `Drop` on return.
             // Log the hit: status 200, cached=true, no usage (tokens were spent on the miss).
             let mut rec = LogContext::for_request(
+                request_id.clone(),
                 key.id,
                 key.tenant_id,
                 provider_snake(cached.provider),
@@ -301,6 +332,7 @@ async fn proxy(State(state): State<AppState>, req: Request) -> Response {
     // default to the resolved primary; the non-stream walk overrides them with the target that
     // actually answered. `virtual_key_id` carries `key.id` for the rate-limit/stream paths.
     let log_ctx = LogContext::for_request(
+        request_id,
         key.id,
         key.tenant_id,
         provider_snake(chain[0].provider),

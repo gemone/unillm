@@ -31,12 +31,15 @@ impl SqliteStore {
     /// `SQLITE_CANTOPEN` (code 14). The SQLite dev backend is expected to create the file, so we
     /// force it on here; `sqlite::memory:` is unaffected. Callers therefore don't need `?mode=rwc`.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(opts)
-            .await?;
-        Self::from_pool(pool).await
+        Self::from_pool(pool_at(url).await?).await
+    }
+
+    /// Like [`connect`](Self::connect) but skips migrations — for prod where migrations run via
+    /// `sqlx migrate run` in CI (`UNILLM_RUN_MIGRATIONS=false`, `DESIGN.md` §21).
+    pub async fn connect_without_migrations(url: &str) -> Result<Self, StoreError> {
+        Ok(Self {
+            pool: pool_at(url).await?,
+        })
     }
 
     /// Adopt an existing pool and apply migrations (useful for tests / shared pools).
@@ -48,6 +51,15 @@ impl SqliteStore {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+/// Open a `SqlitePool` at `url` with `create_if_missing(true)` (the dev backend creates the file).
+async fn pool_at(url: &str) -> Result<SqlitePool, StoreError> {
+    let opts = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+    Ok(SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await?)
 }
 
 // --- row mapping (TEXT/JSON → typed Rust) -------------------------------------
@@ -626,7 +638,7 @@ mod tests {
 
     use crate::SqliteStore;
     use crate::model::{FallbackTarget, GroupBy, NewRequestLog, NewUsage};
-    use crate::store::LogStore;
+    use crate::store::{KeyStore, LogStore};
 
     #[test]
     fn fallback_target_round_trips_json() {
@@ -652,6 +664,18 @@ mod tests {
             cached: false,
             latency_ms: Some(42),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_without_migrations_skips_tables() {
+        // §21: the no-migrations path opens the pool but does NOT create the schema.
+        let store = SqliteStore::connect_without_migrations("sqlite::memory:")
+            .await
+            .unwrap();
+        assert!(
+            store.list_keys(None).await.is_err(),
+            "tables should not exist"
+        );
     }
 
     #[tokio::test]

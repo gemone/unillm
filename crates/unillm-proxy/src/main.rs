@@ -39,7 +39,11 @@ async fn main() {
 async fn serve() {
     let cfg = config::from_env();
 
-    let store = match SqliteStore::connect(&cfg.database_url).await {
+    let store = match if cfg.run_migrations {
+        SqliteStore::connect(&cfg.database_url).await
+    } else {
+        SqliteStore::connect_without_migrations(&cfg.database_url).await
+    } {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("FATAL: could not open storage at {}: {e}", cfg.database_url);
