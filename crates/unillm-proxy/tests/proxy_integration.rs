@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use serde_json::{Value, json};
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use unillm_core::retry::RetryPolicy;
@@ -202,6 +202,15 @@ const ANTHROPIC_SSE: &str = concat!(
     "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
     "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A CC stream that emits `reasoning_content` before the answer (DeepSeek reasoner / v4-flash).
+const REASONING_SSE: &str = concat!(
+    "data: {\"id\":\"c1\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"想\"}}]}\n\n",
+    "data: {\"id\":\"c1\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"好了\"}}]}\n\n",
+    "data: {\"id\":\"c1\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"答案\"}}]}\n\n",
+    "data: {\"id\":\"c1\",\"model\":\"deepseek-reasoner\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: [DONE]\n\n",
 );
 
 async fn mount_sse(server: &MockServer, p: &str, body: &'static str) {
@@ -2251,4 +2260,74 @@ async fn canonical_inbound_non_stream() {
     assert_eq!(body["output"][0]["content"], "hello");
     assert_eq!(body["stop_reason"], "end_turn");
     assert_eq!(body["usage"]["input_tokens"], 3);
+}
+
+#[tokio::test]
+async fn multi_turn_tool_loop_translates_history() {
+    // §8: a prior assistant tool_call + its output must be translated into the CC `tool_calls` +
+    // `tool` messages for the next turn. The mock only matches when those fragments are present.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .and(body_string_contains("\"tool_calls\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "sunny"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("gpt-4o", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/unillm/v1/responses"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"gpt-4o","input":[
+            {"type":"message","role":"user","content":"weather in sf?"},
+            {"type":"function_call","id":"call_1","name":"get_weather","arguments":"{\"q\":\"sf\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"][0]["content"], "sunny");
+}
+
+#[tokio::test]
+async fn stream_reasoning_surfaces_in_sse() {
+    // A reasoning model's stream (`reasoning_content` then `content`) is re-emitted on the CC
+    // outbound as `delta.reasoning_content` before the answer deltas.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(REASONING_SSE.as_bytes(), "text/event-stream"),
+        )
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("gpt-4o", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"think then answer"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"reasoning_content\":\"想"));
+    assert!(body.contains("\"content\":\"答案"));
+    assert!(body.ends_with("data: [DONE]\n\n"));
 }
