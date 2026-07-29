@@ -2128,3 +2128,127 @@ async fn usage_grouped_by_model() {
     assert!(models.contains(&"gpt-4o".to_string()));
     assert!(models.contains(&"gpt-4o-mini".to_string()));
 }
+
+// --- dialect matrix gaps + error paths (production-relevant) -------------------
+
+#[tokio::test]
+async fn anthropic_inbound_tool_use_cross_dialect() {
+    // Anthropic-shaped tools → CC backend returns tool_calls → proxy re-translates to an Anthropic
+    // `tool_use` content block. Exercises the full tool round-trip across dialects.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"q\":\"sf\"}"}}
+            ]}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("fast", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/v1/messages"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"fast","max_tokens":100,
+            "messages":[{"role":"user","content":"weather in sf?"}],
+            "tools":[{"name":"get_weather","description":"weather","input_schema":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    let block = &body["content"].as_array().unwrap()[0];
+    assert_eq!(block["type"], "tool_use");
+    assert_eq!(block["name"], "get_weather");
+    assert_eq!(block["input"], json!({"q": "sf"}));
+}
+
+#[tokio::test]
+async fn upstream_4xx_forwarded_not_retried() {
+    // §10.7: an upstream 4xx (except 429) is forwarded to the client, not retried.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"message": "bad"}})),
+        )
+        .expect(1) // not retried → exactly one upstream call
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("gpt-4o", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+async fn upstream_unreachable_is_502() {
+    // A connection failure (io) maps to 502 (`DESIGN.md` §15.1/§10.7).
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, "http://127.0.0.1:1".into()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("gpt-4o", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+}
+
+#[tokio::test]
+async fn canonical_inbound_non_stream() {
+    // /unillm/v1/responses (canonical) → CC backend → canonical Response egress.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c1", "model": "gpt-4o", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        })))
+        .mount(&upstream)
+        .await;
+    let mut clients = HashMap::new();
+    clients.insert(
+        ProviderId::Openai,
+        client_for(ProviderId::Openai, upstream.uri()),
+    );
+    let (url, secret) = authed_proxy(clients, &[("gpt-4o", "openai", "gpt-4o")]).await;
+    let resp = http()
+        .post(format!("{url}/unillm/v1/responses"))
+        .header("authorization", format!("Bearer {secret}"))
+        .json(&json!({"model":"gpt-4o","input":[{"type":"message","role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["role"], "assistant");
+    assert_eq!(body["output"][0]["content"], "hello");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+}
