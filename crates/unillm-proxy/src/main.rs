@@ -21,8 +21,21 @@ use unillm_proxy::server::{AppState, Stores, build_app};
 /// Scopes granted to an env-seeded dev key (`DESIGN.md` §13.1).
 const SEED_SCOPES: &[&str] = &["data", "admin", "read-usage"];
 
+/// Initialize structured JSON logging to stdout (`DESIGN.md` §17). Level from `RUST_LOG` (default
+/// `info`).
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(filter)
+        .json()
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let cli = Cli::parse();
     match cli.command {
         Some(TopCmd::Admin { cmd }) => {
@@ -93,7 +106,7 @@ async fn serve() {
         match open_stores(&cfg.database_url, cfg.run_migrations).await {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("FATAL: could not open storage at {}: {e}", cfg.database_url);
+                tracing::error!("could not open storage at {}: {e}", cfg.database_url);
                 return;
             }
         };
@@ -119,8 +132,8 @@ async fn serve() {
                 })
                 .await
             {
-                Ok(_) => eprintln!("seeded dev key: {secret}"),
-                Err(e) => eprintln!("WARNING: could not seed dev key: {e}"),
+                Ok(_) => tracing::info!(secret = %secret, "seeded dev key"),
+                Err(e) => tracing::warn!("could not seed dev key: {e}"),
             }
         }
     }
@@ -134,12 +147,12 @@ async fn serve() {
                 clients.insert(*provider, Arc::new(c));
             }
             Err(e) => {
-                eprintln!("WARNING: could not build client for {provider:?}: {e}");
+                tracing::warn!("could not build client for {provider:?}: {e}");
             }
         }
     }
     if clients.is_empty() {
-        eprintln!("WARNING: no upstream providers configured (set UNILLM_PROV_*_KEY env vars)");
+        tracing::warn!("no upstream providers configured (set UNILLM_PROV_*_KEY env vars)");
     }
 
     let stores = Stores {
@@ -163,6 +176,6 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
         .expect("failed to bind");
-    eprintln!("unillm-proxy listening on {}", cfg.bind);
+    tracing::info!("unillm-proxy listening on {}", cfg.bind);
     axum::serve(listener, app).await.expect("server error");
 }

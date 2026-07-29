@@ -33,6 +33,8 @@ use unillm_storage::{
 };
 use uuid::Uuid;
 
+use tracing::Instrument;
+
 use crate::config::RequestLimits;
 use crate::inbound::{Format, detect_format, parse_request};
 use crate::metrics::{CacheOutcome, Metrics};
@@ -118,8 +120,11 @@ pub fn build_app(state: AppState) -> Router {
 #[derive(Clone)]
 struct RequestId(String);
 
-/// Generate/accept the request id and echo it on every response (`DESIGN.md` §17).
+/// Generate/accept the request id, open a per-request tracing span, and echo the id on every
+/// response (`DESIGN.md` §17).
 async fn request_id_middleware(mut req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     let id = req
         .headers()
         .get("x-unillm-request-id")
@@ -127,8 +132,9 @@ async fn request_id_middleware(mut req: Request, next: Next) -> Response {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let span = tracing::info_span!("request", request_id = %id, %method, %path);
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut resp = next.run(req).await;
+    let mut resp = next.run(req).instrument(span).await;
     if let Ok(hv) = HeaderValue::from_str(&id) {
         resp.headers_mut().insert("x-unillm-request-id", hv);
     }

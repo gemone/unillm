@@ -129,7 +129,7 @@ pub fn spawn_log(
             u.cost_usd = compute_cost(&*models, &log.provider, &log.model, u).await;
         }
         if let Err(e) = logs.insert_request_log(log, usage).await {
-            eprintln!("WARNING: request log write failed: {e}");
+            tracing::warn!("request log write failed: {e}");
         }
     });
 }

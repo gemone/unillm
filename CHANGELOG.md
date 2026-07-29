@@ -51,9 +51,12 @@ standalone translator proxy covering **OpenAI, Anthropic, OpenRouter, and DeepSe
   key-scoped (no cross-key leakage), metadata excluded, canonical `Response` value (one entry
   serves all outbound formats), non-stream 2xx only, `X-Unillm-Cache: HIT|MISS`, admin
   invalidation (`DESIGN.md` §7.4).
-- **Observability** — `/metrics` Prometheus exposition (request counters, token/cost totals,
-  latency histogram); `/health` (liveness), `/ready` (readiness); `/openapi.json` + Scalar
-  `/docs` for the admin surface (`DESIGN.md` §17).
+- **Observability** — structured `tracing` JSON logs to stdout (per-request spans, `RUST_LOG`
+  level); request id accepted from / echoed via `X-Unillm-Request-Id` (§17); `/metrics` Prometheus
+  exposition (request counters, token/cost totals, latency histogram); `/health` (liveness),
+  `/ready` (readiness); `/openapi.json` + Scalar `/docs` for the admin surface.
+- **PostgreSQL backend** — `PostgresStore` is wired into `serve()` by `database_url` scheme
+  (`postgres://` → PG, else SQLite), behind a `postgres` cargo feature (`DESIGN.md` §11.2).
 - **Packaging** — multi-stage `Dockerfile` (`rust:1.95` → `debian:stable-slim`); GitHub Actions
   `ci.yml` (fmt, clippy `-D warnings`, workspace + postgres tests, pytest, mypy `--strict`,
   `cargo audit`) and `release.yml` (PyPI wheels via maturin, ghcr image, GitHub release on
@@ -65,6 +68,10 @@ standalone translator proxy covering **OpenAI, Anthropic, OpenRouter, and DeepSe
   failed to boot with `SQLITE_CANTOPEN` (code 14) on the default `sqlite://./unillm.db` url
   (in-memory tests were unaffected). `SqliteStore::connect` now forces `create_if_missing(true)`;
   default url aligned to `sqlite://./unillm.db` (`DESIGN.md` §14.1).
+- **`UNILLM_RUN_MIGRATIONS` gate** — migrations ran unconditionally at startup; now default on but
+  skippable (`=false`) so prod can run them via `sqlx migrate run` in CI (`DESIGN.md` §21).
+- **Malformed JSON body** — a client-side bad body returned 500 (`CoreError::Serde`); now 400
+  `invalid_request` (`DESIGN.md` §15.1).
 
 ### Deferred (tracked, post-v1)
 

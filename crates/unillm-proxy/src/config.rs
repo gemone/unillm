@@ -108,8 +108,8 @@ pub fn from_env() -> Config {
     let key_pepper = match env::var("UNILLM_KEY_PEPPER") {
         Ok(p) => p,
         Err(_) => {
-            eprintln!(
-                "WARNING: UNILLM_KEY_PEPPER unset; using insecure default. Set it in production."
+            tracing::warn!(
+                "UNILLM_KEY_PEPPER unset; using insecure default. Set it in production."
             );
             "unillm-insecure-dev-pepper".into()
         }
