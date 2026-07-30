@@ -1,5 +1,5 @@
 -- M4.1 config tables (DESIGN.md §11.3) in native PostgreSQL shapes: UUID, JSONB, TIMESTAMPTZ,
--- BOOLEAN, NUMERIC. Mirrors the SQLite schema in ../sqlite/0001_config.sql column-for-column.
+-- BOOLEAN, DOUBLE PRECISION. Mirrors the SQLite schema in ../sqlite/0001_config.sql column-for-column.
 
 CREATE TABLE virtual_keys (
   id                    UUID    PRIMARY KEY,
@@ -26,9 +26,9 @@ CREATE TABLE models (
   display_name      TEXT    NOT NULL,
   context_window    INT,
   max_output        INT,
-  price_in          NUMERIC(12,6),                      -- per 1M tokens
-  price_out         NUMERIC(12,6),
-  price_cache_read  NUMERIC(12,6),
+  price_in          DOUBLE PRECISION,                   -- per 1M tokens (f64)
+  price_out         DOUBLE PRECISION,
+  price_cache_read  DOUBLE PRECISION,
   enabled           BOOLEAN NOT NULL DEFAULT true,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (provider, native_model)

@@ -27,6 +27,6 @@ CREATE TABLE usage (
   output_tokens   BIGINT  NOT NULL DEFAULT 0,
   cache_read      BIGINT  NOT NULL DEFAULT 0,
   cache_creation  BIGINT  NOT NULL DEFAULT 0,
-  cost_usd        NUMERIC(12,6)
+  cost_usd        DOUBLE PRECISION
 );
 CREATE INDEX ix_usage_key ON usage(request_log_id);
